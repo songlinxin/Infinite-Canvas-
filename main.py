@@ -1271,6 +1271,11 @@ class RunningHubWorkflowConfigField(BaseModel):
     sourceFromUpstream: bool = True
     group: str = ""
     note: str = ""
+    options: List[str] = Field(default_factory=list)
+    random_enabled: bool = False
+    min: Any = ""
+    max: Any = ""
+    step: Any = ""
     imageOrder: int = 0
     required: bool = False
 
