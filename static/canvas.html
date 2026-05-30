@@ -16,12 +16,12 @@
             } catch(e) {}
         })();
     </script>
-    <script src="/static/vendor/js/tailwindcss-cdn.js?v=2026.05.29.1"></script>
-    <script src="/static/vendor/js/lucide.js?v=2026.05.29.1"></script>
-    <script src="/static/js/theme.js?v=2026.05.29.1"></script>
-    <script src="/static/js/i18n.js?v=2026.05.29.1"></script>
-    <link rel="stylesheet" href="/static/css/canvas.css?v=2026.05.29.1">
-    <link rel="stylesheet" href="/static/css/theme.css?v=2026.05.29.1">
+    <script src="/static/vendor/js/tailwindcss-cdn.js?v=2026.05.29.2"></script>
+    <script src="/static/vendor/js/lucide.js?v=2026.05.29.2"></script>
+    <script src="/static/js/theme.js?v=2026.05.29.2"></script>
+    <script src="/static/js/i18n.js?v=2026.05.29.2"></script>
+    <link rel="stylesheet" href="/static/css/canvas.css?v=2026.05.29.2">
+    <link rel="stylesheet" href="/static/css/theme.css?v=2026.05.29.2">
 </head>
 <body>
     <div id="shell" class="shell no-canvas">
@@ -155,6 +155,25 @@
             </div>
             </div>
         </div>
+        <div id="promptTemplateModal" class="prompt-template-modal" onclick="closePromptTemplateModal()">
+            <div class="prompt-template-panel" onclick="event.stopPropagation()">
+                <div class="prompt-template-head">
+                    <div>
+                        <div class="prompt-template-title" data-i18n="canvas.promptTemplateLibrary">提示词模板库</div>
+                        <div class="prompt-template-sub" data-i18n="canvas.promptTemplateSystem">系统提示词</div>
+                    </div>
+                    <button class="preview-icon-btn" type="button" onclick="closePromptTemplateModal()" title="关闭" aria-label="关闭" data-i18n-title="common.close"><i data-lucide="x" class="w-4 h-4"></i></button>
+                </div>
+                <div class="prompt-template-toolbar">
+                    <input id="promptTemplateSearch" class="prompt-template-search" type="search" placeholder="搜索模板" data-i18n-placeholder="canvas.promptTemplateSearch">
+                    <div id="promptTemplateCats" class="prompt-template-cats"></div>
+                </div>
+                <div class="prompt-template-content">
+                    <div id="promptTemplateList" class="prompt-template-list"></div>
+                    <div id="promptTemplateDetail" class="prompt-template-detail"></div>
+                </div>
+            </div>
+        </div>
         <div id="logModal" class="log-modal" onclick="closeCanvasLog()">
             <div class="log-panel" onclick="event.stopPropagation()">
                 <div class="log-head">
@@ -266,7 +285,7 @@
         </div>
     </div>
 
-    <script src="/static/js/ltx-director-timeline.js?v=2026.05.29.1"></script>
-    <script src="/static/js/canvas.js?v=2026.05.29.1"></script>
+    <script src="/static/js/ltx-director-timeline.js?v=2026.05.29.2"></script>
+    <script src="/static/js/canvas.js?v=2026.05.29.2"></script>
 </body>
 </html>

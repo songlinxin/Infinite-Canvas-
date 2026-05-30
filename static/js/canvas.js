@@ -89,6 +89,12 @@ const outputPromptPanel = document.getElementById('outputPromptPanel');
 const outputPromptText = document.getElementById('outputPromptText');
 const outputCopyPromptBtn = document.getElementById('outputCopyPromptBtn');
 const outputRerunBtn = document.getElementById('outputRerunBtn');
+const promptTemplateModal = document.getElementById('promptTemplateModal');
+const promptTemplatePanel = promptTemplateModal?.querySelector('.prompt-template-panel');
+const promptTemplateSearch = document.getElementById('promptTemplateSearch');
+const promptTemplateCats = document.getElementById('promptTemplateCats');
+const promptTemplateList = document.getElementById('promptTemplateList');
+const promptTemplateDetail = document.getElementById('promptTemplateDetail');
 const logModal = document.getElementById('logModal');
 const logList = document.getElementById('logList');
 const errorModal = document.getElementById('errorModal');
@@ -167,6 +173,12 @@ let outputTimer = null;
 let loopContext = null;
 let clipboard = null;
 let lastImagePasteAt = 0;
+let promptTemplateNodeId = '';
+let promptTemplateCategory = 'all';
+let promptTemplateSelectedId = '';
+let promptTemplateQuery = '';
+let canvasPromptTemplates = [];
+let canvasPromptTemplatesLoaded = false;
 const activeCanvasTaskPolls = new Set();
 let hoveredConnectionId = '';
 let lastMouseBoard = {x: 0, y: 0};
@@ -5113,8 +5125,14 @@ function renderNode(node){
         }
     }
     if(node.type === 'prompt') {
-        body.innerHTML = `<div class="prompt-editor"><textarea placeholder="${tr('canvas.promptPlaceholder')}">${escapeHtml(node.text || '')}</textarea>${promptCounterHtml(node.text || '')}</div>`;
+        body.innerHTML = `<div class="prompt-editor"><div class="prompt-toolbar"><button class="prompt-template-btn" type="button" data-prompt-template-open title="${escapeAttr(tr('canvas.promptTemplateLibrary'))}"><i data-lucide="library"></i><span>${escapeHtml(tr('canvas.promptTemplateShort'))}</span></button>${promptCounterHtml(node.text || '')}</div><textarea placeholder="${tr('canvas.promptPlaceholder')}">${escapeHtml(node.text || '')}</textarea></div>`;
         const textarea = body.querySelector('textarea');
+        const templateBtn = body.querySelector('[data-prompt-template-open]');
+        templateBtn.onclick = e => {
+            e.preventDefault();
+            e.stopPropagation();
+            openPromptTemplateModal(node.id);
+        };
         bindScrollableText(textarea);
         textarea.oninput = e => {
             node.text = e.target.value;
@@ -5534,6 +5552,127 @@ function refreshPromptCounter(container, text){
     const count = promptTextLength(text);
     counter.classList.toggle('over', count > PROMPT_TEXT_MAX_LENGTH);
     counter.innerHTML = `<span>${count.toLocaleString()}</span><span>/ ${PROMPT_TEXT_MAX_LENGTH.toLocaleString()}</span>`;
+}
+async function loadCanvasPromptTemplates(){
+    if(canvasPromptTemplatesLoaded) return canvasPromptTemplates;
+    try {
+        const data = await fetch('/api/smart-canvas/prompt-templates').then(r => r.ok ? r.json() : {templates:[]});
+        canvasPromptTemplates = Array.isArray(data.templates) ? data.templates.filter(t => t?.id && t?.positive) : [];
+    } catch(e) {
+        canvasPromptTemplates = [];
+    }
+    canvasPromptTemplatesLoaded = true;
+    return canvasPromptTemplates;
+}
+function canvasPromptTemplateCategoryLabel(category){
+    const labels = {
+        all:tr('canvas.promptTemplateAll'),
+        view:tr('canvas.promptTemplateView'),
+        storyboard:tr('canvas.promptTemplateStoryboard'),
+        character:tr('canvas.promptTemplateCharacter'),
+        product:tr('canvas.promptTemplateProduct'),
+        lighting:tr('canvas.promptTemplateLighting')
+    };
+    return labels[category] || category || '';
+}
+function canvasPromptTemplateName(template){
+    if(langIsEn() && template?.name_en) return template.name_en;
+    return template?.name || '';
+}
+function canvasPromptTemplateScene(template){
+    if(langIsEn() && template?.scene_en) return template.scene_en;
+    return template?.scene || '';
+}
+function canvasPromptTemplateText(template, mode='positive'){
+    const positive = String(template?.positive || '').trim();
+    if(mode === 'positive') return positive;
+    const negative = String(template?.negative || '').trim();
+    const params = Object.entries(template?.params || {})
+        .map(([key, value]) => `${key}: ${value}`)
+        .join('\n');
+    return [positive, negative ? `Negative prompt:\n${negative}` : '', params ? `Params:\n${params}` : ''].filter(Boolean).join('\n\n');
+}
+function canvasPromptTemplateSearchText(template){
+    return [
+        template?.name,
+        template?.name_en,
+        template?.scene,
+        template?.scene_en,
+        template?.positive,
+        template?.negative
+    ].join(' ').toLowerCase();
+}
+function canvasPromptTemplateVisibleItems(){
+    const query = promptTemplateQuery.trim().toLowerCase();
+    return canvasPromptTemplates.filter(item => {
+        if(promptTemplateCategory !== 'all' && item.category !== promptTemplateCategory) return false;
+        if(!query) return true;
+        return canvasPromptTemplateSearchText(item).includes(query);
+    });
+}
+function renderPromptTemplateModal(){
+    if(!promptTemplateModal || !promptTemplateCats || !promptTemplateList || !promptTemplateDetail) return;
+    const counts = canvasPromptTemplates.reduce((map, item) => {
+        const category = item.category || 'storyboard';
+        map[category] = (map[category] || 0) + 1;
+        map.all += 1;
+        return map;
+    }, {all:0});
+    const order = ['all', 'view', 'storyboard', 'character', 'product', 'lighting'];
+    promptTemplateCats.innerHTML = order
+        .filter(category => category === 'all' || counts[category])
+        .map(category => `<button class="prompt-template-cat ${category === promptTemplateCategory ? 'active' : ''}" type="button" data-prompt-template-cat="${escapeAttr(category)}"><span>${escapeHtml(canvasPromptTemplateCategoryLabel(category))}</span><small>${counts[category] || 0}</small></button>`)
+        .join('');
+    const items = canvasPromptTemplateVisibleItems();
+    if(items.length && !items.some(item => item.id === promptTemplateSelectedId)) promptTemplateSelectedId = items[0].id;
+    const selected = items.find(item => item.id === promptTemplateSelectedId) || items[0] || null;
+    promptTemplateList.innerHTML = items.length ? items.map(item => `
+        <button class="prompt-template-item ${item.id === selected?.id ? 'active' : ''}" type="button" data-prompt-template-id="${escapeAttr(item.id)}">
+            <span class="prompt-template-item-name">${escapeHtml(canvasPromptTemplateName(item))}</span>
+            <span class="prompt-template-item-scene">${escapeHtml(canvasPromptTemplateScene(item) || item.positive || '')}</span>
+            <span class="prompt-template-tag">${escapeHtml(canvasPromptTemplateCategoryLabel(item.category || 'storyboard'))}</span>
+        </button>
+    `).join('') : `<div class="prompt-template-empty">${escapeHtml(tr('canvas.promptTemplateEmpty'))}</div>`;
+    promptTemplateDetail.innerHTML = selected ? `
+        <h3>${escapeHtml(canvasPromptTemplateName(selected))}</h3>
+        <div class="prompt-template-section">
+            <label>${escapeHtml(tr('canvas.promptTemplatePositive'))}</label>
+            <p>${escapeHtml(selected.positive || '')}</p>
+        </div>
+        ${selected.negative ? `<div class="prompt-template-section"><label>${escapeHtml(tr('canvas.promptTemplateNegative'))}</label><p>${escapeHtml(selected.negative)}</p></div>` : ''}
+        ${Object.keys(selected.params || {}).length ? `<div class="prompt-template-section"><label>${escapeHtml(tr('canvas.promptTemplateParams'))}</label><p>${escapeHtml(Object.entries(selected.params).map(([k,v]) => `${k}: ${v}`).join('\n'))}</p></div>` : ''}
+        <div class="prompt-template-actions">
+            <button type="button" data-prompt-template-apply="positive"><i data-lucide="corner-down-left" class="w-3.5 h-3.5"></i><span>${escapeHtml(tr('canvas.promptTemplateApplyPositive'))}</span></button>
+            <button type="button" class="primary" data-prompt-template-apply="full"><i data-lucide="wand-sparkles" class="w-3.5 h-3.5"></i><span>${escapeHtml(tr('canvas.promptTemplateApplyFull'))}</span></button>
+        </div>
+    ` : `<div class="prompt-template-empty">${escapeHtml(tr('canvas.promptTemplatePick'))}</div>`;
+    refreshIcons();
+}
+async function openPromptTemplateModal(nodeId){
+    promptTemplateNodeId = nodeId || '';
+    promptTemplateQuery = '';
+    if(promptTemplateSearch) promptTemplateSearch.value = '';
+    await loadCanvasPromptTemplates();
+    if(!promptTemplateCategory) promptTemplateCategory = 'all';
+    if(!promptTemplateSelectedId) promptTemplateSelectedId = canvasPromptTemplates[0]?.id || '';
+    renderPromptTemplateModal();
+    promptTemplateModal?.classList.add('open');
+    promptTemplateSearch?.focus();
+}
+function closePromptTemplateModal(){
+    promptTemplateModal?.classList.remove('open');
+    promptTemplateNodeId = '';
+}
+function applyPromptTemplateToPromptNode(mode='positive'){
+    const template = canvasPromptTemplates.find(item => item.id === promptTemplateSelectedId);
+    const node = nodes.find(n => n.id === promptTemplateNodeId && n.type === 'prompt');
+    if(!template || !node) return;
+    node.text = canvasPromptTemplateText(template, mode);
+    closePromptTemplateModal();
+    scheduleSave();
+    syncGeneratorInputs();
+    refreshGeneratorInputViews();
+    render();
 }
 function renderLoopBody(node){
     const wrap = document.createElement('div');
@@ -10150,6 +10289,29 @@ function setupOutputPromptPanel(meta){
         rerunFromOutputMeta(currentOutputMeta);
     };
 }
+promptTemplateSearch?.addEventListener('input', event => {
+    promptTemplateQuery = event.target.value || '';
+    renderPromptTemplateModal();
+});
+promptTemplatePanel?.addEventListener('click', event => {
+    const cat = event.target.closest('[data-prompt-template-cat]');
+    if(cat){
+        promptTemplateCategory = cat.dataset.promptTemplateCat || 'all';
+        promptTemplateSelectedId = '';
+        renderPromptTemplateModal();
+        return;
+    }
+    const item = event.target.closest('[data-prompt-template-id]');
+    if(item){
+        promptTemplateSelectedId = item.dataset.promptTemplateId || '';
+        renderPromptTemplateModal();
+        return;
+    }
+    const apply = event.target.closest('[data-prompt-template-apply]');
+    if(apply){
+        applyPromptTemplateToPromptNode(apply.dataset.promptTemplateApply || 'positive');
+    }
+});
 function rerunFromOutputMeta(meta){
     if(!ensureCanvas() || !meta?.run?.nodeType) return;
     const base = JSON.parse(JSON.stringify(meta.run.node || {}));
@@ -11229,6 +11391,7 @@ window.addEventListener('keydown', e => {
     if(!canvas) return;
     if(e.key === 'Shift' && !isEditableTarget(document.activeElement)) setKnifeMode(true);
     if(e.key === 'Escape' && document.getElementById('imageEditModal').classList.contains('open')) { closeImageEditor(); return; }
+    if(e.key === 'Escape' && promptTemplateModal?.classList.contains('open')) { closePromptTemplateModal(); return; }
     if(outputLightbox.classList.contains('open') && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')){
         if(navigateOutputLightbox(e.key === 'ArrowRight' ? 1 : -1)){
             e.preventDefault();

@@ -80,6 +80,8 @@ let assetTab = 'image';
 let activeAssetCategoryId = '';
 let mentionSource = 'input';
 let mentionAssetCategoryId = '';
+let assetLibraryUpdatedAt = 0;
+let assetLibraryRefreshTimer = null;
 const PROMPT_PRESETS_KEY = 'smart_canvas_prompt_presets_v1';
 const PROMPT_TEMPLATE_GROUPS_KEY = 'smart_canvas_prompt_template_groups_v1';
 const PROMPT_TEMPLATE_OVERRIDES_KEY = 'smart_canvas_prompt_template_overrides_v1';
@@ -194,6 +196,39 @@ let previewCompareDrag = false;
 let previewComparePos = 50;
 let imageEditPanDrag = null;
 let previewNavState = {nodeId:'', index:0, count:0};
+const PANORAMA_RATIO_PRESETS = {
+    square:{w:1, h:1},
+    portrait:{w:2, h:3},
+    landscape:{w:3, h:2},
+    portrait43:{w:3, h:4},
+    landscape43:{w:4, h:3},
+    story:{w:9, h:16},
+    wide:{w:16, h:9},
+    ultrawide:{w:21, h:9},
+    ultratall:{w:9, h:21}
+};
+let panoramaState = {
+    enabled:false,
+    ratio:'wide',
+    customW:16,
+    customH:9,
+    fov:75,
+    yaw:0,
+    pitch:0,
+    drag:null,
+    three:null,
+    renderer:null,
+    scene:null,
+    camera:null,
+    sphere:null,
+    texture:null,
+    image:null,
+    ctx:null,
+    animationId:0,
+    loadedSrc:'',
+    loadToken:0
+};
+window.__smartCanvasPanoramaState = panoramaState;
 let viewport = {x:0, y:0, scale:1};
 let settings = {
     engine:'api',
@@ -2468,6 +2503,7 @@ function savePromptPresets(){
 }
 function defaultPromptTemplateGroups(){
     return [
+        {id:'view', name:tr('smart.tplCatView')},
         {id:'storyboard', name:tr('smart.tplCatStoryboard')},
         {id:'character', name:tr('smart.tplCatCharacter')},
         {id:'product', name:tr('smart.tplCatProduct')},
@@ -2559,6 +2595,7 @@ function promptTemplateSearchText(template){
 function promptTemplateCategoryLabel(category){
     if(category === 'all') return tr('smart.tplAll');
     const builtin = {
+        view:tr('smart.tplCatView'),
         storyboard:tr('smart.tplCatStoryboard'),
         character:tr('smart.tplCatCharacter'),
         product:tr('smart.tplCatProduct'),
@@ -2709,13 +2746,13 @@ function renderPromptTemplatePanel(options={}){
             </div>
             <div class="prompt-template-group-list">
                 ${promptTemplateGroups.map(group => `
-                    <div class="prompt-template-group-row ${['storyboard','character','product','lighting','mine'].includes(group.id) ? '' : 'has-delete'}">
+                    <div class="prompt-template-group-row ${['view','storyboard','character','product','lighting','mine'].includes(group.id) ? '' : 'has-delete'}">
                         <button type="button" class="group-name ${group.id === promptTemplateCategory ? 'active' : ''}" data-template-cat="${escapeHtml(group.id)}">
                             <span>${escapeHtml(promptTemplateCategoryLabel(group.id))}</span>
                             <small>${groupCounts[group.id] || 0}</small>
                         </button>
                         <button type="button" class="group-tool" data-template-cat-edit="${escapeHtml(group.id)}" title="${escapeAttr(tr('smart.tplRename'))}"><i data-lucide="pencil"></i></button>
-                        ${['storyboard','character','product','lighting','mine'].includes(group.id) ? '' : `<button type="button" class="group-tool danger" data-template-cat-delete="${escapeHtml(group.id)}" title="${escapeAttr(tr('common.delete'))}"><i data-lucide="trash-2"></i></button>`}
+                        ${['view','storyboard','character','product','lighting','mine'].includes(group.id) ? '' : `<button type="button" class="group-tool danger" data-template-cat-delete="${escapeHtml(group.id)}" title="${escapeAttr(tr('common.delete'))}"><i data-lucide="trash-2"></i></button>`}
                     </div>
                 `).join('')}
             </div>
@@ -2958,7 +2995,7 @@ function renamePromptTemplateGroup(groupId){
     renderPromptTemplatePanel();
 }
 function deletePromptTemplateGroup(groupId){
-    if(['storyboard','character','product','lighting','mine'].includes(groupId)){
+    if(['view','storyboard','character','product','lighting','mine'].includes(groupId)){
         renamePromptTemplateGroup(groupId);
         return;
     }
@@ -2988,17 +3025,70 @@ function activeAssetCategory(){
 async function loadAssetLibrary(){
     try {
         const data = await fetch('/api/asset-library').then(r => r.json());
-        assetLibrary = data.library || {categories:[]};
-        if(!activeAssetCategoryId) activeAssetCategoryId = activeAssetCategory()?.id || '';
+        setAssetLibraryFromResponse(data, {render:false});
         renderAssetLibrary();
     } catch(e) {
         toast(tr('smart.assetLoadFail'));
     }
 }
-function setAssetLibraryFromResponse(data){
+function refreshAssetLibrarySoon(delay=120){
+    clearTimeout(assetLibraryRefreshTimer);
+    assetLibraryRefreshTimer = setTimeout(async () => {
+        await loadAssetLibrary();
+        if(mentionPicker?.classList?.contains('open') && mentionSource === 'asset') renderMentionPicker('asset');
+    }, delay);
+}
+function handleAssetLibraryUpdatedMessage(data={}){
+    const remoteUpdatedAt = Number(data.updated_at || 0);
+    if(remoteUpdatedAt && remoteUpdatedAt <= Number(assetLibraryUpdatedAt || 0)) return;
+    refreshAssetLibrarySoon();
+}
+function connectAssetLibrarySyncSocket(){
+    if(window.parent && window.parent !== window) return;
+    const host = window.location.host;
+    if(!host) return;
+    const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
+    const clientId = `canvas_asset_${Math.random().toString(36).slice(2, 10)}${Date.now().toString(36).slice(-4)}`;
+    let socket;
+    let retryTimer = null;
+    const connect = () => {
+        try {
+            socket = new WebSocket(`${protocol}://${host}/ws/stats?client_id=${clientId}`);
+        } catch(e) {
+            retryTimer = setTimeout(connect, 3000);
+            return;
+        }
+        socket.onmessage = event => {
+            try {
+                const data = JSON.parse(event.data);
+                if(data?.type === 'asset_library_updated') handleAssetLibraryUpdatedMessage(data);
+            } catch(e) {}
+        };
+        socket.onclose = () => {
+            retryTimer = setTimeout(connect, 3000);
+        };
+        socket.onerror = () => {
+            try { socket.close(); } catch(e) {}
+        };
+    };
+    window.addEventListener('beforeunload', () => {
+        clearTimeout(retryTimer);
+        try { socket?.close(); } catch(e) {}
+    });
+    connect();
+}
+function setAssetLibraryFromResponse(data, options={}){
     assetLibrary = data.library || assetLibrary;
+    assetLibraryUpdatedAt = Number(assetLibrary.updated_at || assetLibraryUpdatedAt || 0);
+    const cats = assetCategories('image');
+    if(activeAssetCategoryId && !cats.some(cat => cat.id === activeAssetCategoryId)) activeAssetCategoryId = '';
     if(!activeAssetCategoryId) activeAssetCategoryId = activeAssetCategory()?.id || '';
-    renderAssetLibrary();
+    if(mentionAssetCategoryId && !cats.some(cat => cat.id === mentionAssetCategoryId)) mentionAssetCategoryId = '';
+    if(!mentionAssetCategoryId) mentionAssetCategoryId = activeAssetCategoryId;
+    if(options.render !== false) {
+        renderAssetLibrary();
+        if(mentionPicker?.classList?.contains('open') && mentionSource === 'asset') renderMentionPicker('asset');
+    }
 }
 function toggleAssetLibrary(open=!assetLibraryOpen){
     assetLibraryOpen = !!open;
@@ -5547,6 +5637,7 @@ function setImageEditMode(mode, userTouched=false){
     const zoomLabel = document.getElementById('imageEditZoomLabel');
     const cancelBtn = document.getElementById('imageEditCancelBtn');
     const isPreview = imageEditMode === 'preview';
+    if(!isPreview && panoramaState.enabled) disposePanoramaPreview();
     cropCanvasEl.style.display = isPreview ? 'none' : '';
     previewStageEl.style.display = isPreview ? 'inline-flex' : 'none';
     editStageEl?.classList.toggle('preview-mode', isPreview);
@@ -5573,6 +5664,8 @@ function setImageEditMode(mode, userTouched=false){
     syncGridGapValue();
     const applyBtn = document.getElementById('imageEditApplyBtn');
     document.getElementById('compareToggleBtn').style.display = isPreview && !isVideoPreview ? 'inline-flex' : 'none';
+    document.getElementById('panoramaToggleBtn').style.display = isPreview && !isVideoPreview ? 'inline-flex' : 'none';
+    document.getElementById('panoramaExportBtn').style.display = isPreview && !isVideoPreview && panoramaState.enabled ? 'inline-flex' : 'none';
     document.getElementById('compareThumbs').style.display = 'none';
     if(isPreview){
         document.getElementById('imageEditTitle').textContent = isVideoPreview ? '预览视频' : tr('smart.previewImage');
@@ -5616,7 +5709,7 @@ let previewMetaExtraText = '';
 function applyPreviewTransform(){
     const frame = document.getElementById('previewFrame');
     if(frame){
-        frame.style.transform = `translate(${previewPan.x}px, ${previewPan.y}px) scale(${previewZoom})`;
+        frame.style.transform = panoramaState.enabled ? '' : `translate(${previewPan.x}px, ${previewPan.y}px) scale(${previewZoom})`;
     }
     updateZoomLabel();
 }
@@ -5626,6 +5719,287 @@ function resetPreviewTransform(){
     previewComparePos = 50;
     document.getElementById('previewStage')?.style.setProperty('--compare-pos', `${previewComparePos}%`);
     applyPreviewTransform();
+}
+function panoramaRatioValue(){
+    const preset = PANORAMA_RATIO_PRESETS[panoramaState.ratio];
+    if(preset) return preset;
+    return {
+        w:Math.max(1, Number(panoramaState.customW) || 16),
+        h:Math.max(1, Number(panoramaState.customH) || 9)
+    };
+}
+function panoramaResolutionValue(){
+    const longSide = 1536;
+    const ratio = panoramaRatioValue();
+    const aspect = ratio.w / Math.max(1, ratio.h);
+    if(aspect >= 1){
+        return {w:longSide, h:Math.max(1, Math.round(longSide / aspect))};
+    }
+    return {w:Math.max(1, Math.round(longSide * aspect)), h:longSide};
+}
+function panoramaSource(){
+    const editing = currentEditImage();
+    const image = editing.image || {};
+    if(mediaKindForItem(image) !== 'image') return '';
+    return displayMediaUrl(image.url ? image : (image.url || ''));
+}
+function panoramaFallbackSource(){
+    const image = currentEditImage().image || {};
+    return image?.url ? proxiedMediaUrl(image) : '';
+}
+async function ensurePanoramaRenderer(){
+    const canvas = document.getElementById('panoramaCanvas');
+    if(!canvas) return false;
+    panoramaState.ctx = panoramaState.ctx || canvas.getContext('2d');
+    return !!panoramaState.ctx;
+}
+function drawPanoramaFrame(){
+    const canvas = document.getElementById('panoramaCanvas');
+    const ctx = panoramaState.ctx || canvas?.getContext?.('2d');
+    const img = panoramaState.image;
+    if(!panoramaState.enabled || !canvas || !ctx || !img?.naturalWidth || !img?.naturalHeight) return false;
+    panoramaState.ctx = ctx;
+    const cw = Math.max(1, canvas.width);
+    const ch = Math.max(1, canvas.height);
+    const iw = img.naturalWidth;
+    const ih = img.naturalHeight;
+    const aspect = cw / Math.max(1, ch);
+    let viewW = Math.max(1, iw * (Math.max(35, Math.min(100, panoramaState.fov)) / 180));
+    let viewH = viewW / Math.max(0.1, aspect);
+    if(viewH > ih){
+        viewH = ih;
+        viewW = viewH * aspect;
+    }
+    const yaw = ((panoramaState.yaw % 360) + 360) % 360;
+    const centerX = ((yaw + 180) % 360) / 360 * iw;
+    const centerY = ih / 2 - (Math.max(-85, Math.min(85, panoramaState.pitch)) / 180) * ih;
+    let sx = centerX - viewW / 2;
+    const sy = Math.max(0, Math.min(ih - viewH, centerY - viewH / 2));
+    ctx.clearRect(0, 0, cw, ch);
+    ctx.fillStyle = '#020617';
+    ctx.fillRect(0, 0, cw, ch);
+    if(viewW >= iw){
+        ctx.drawImage(img, 0, sy, iw, viewH, 0, 0, cw, ch);
+    } else {
+        while(sx < 0) sx += iw;
+        while(sx >= iw) sx -= iw;
+        const firstW = Math.min(viewW, iw - sx);
+        const firstDw = cw * (firstW / viewW);
+        ctx.drawImage(img, sx, sy, firstW, viewH, 0, 0, firstDw, ch);
+        if(firstW < viewW){
+            const restW = viewW - firstW;
+            ctx.drawImage(img, 0, sy, restW, viewH, firstDw, 0, cw - firstDw, ch);
+        }
+    }
+    return true;
+}
+function renderPanoramaFrame(){
+    if(!drawPanoramaFrame()) return;
+    panoramaState.animationId = requestAnimationFrame(renderPanoramaFrame);
+}
+function startPanoramaLoop(){
+    if(panoramaState.animationId) cancelAnimationFrame(panoramaState.animationId);
+    panoramaState.animationId = requestAnimationFrame(renderPanoramaFrame);
+}
+function stopPanoramaLoop(){
+    if(panoramaState.animationId) cancelAnimationFrame(panoramaState.animationId);
+    panoramaState.animationId = 0;
+}
+function resizePanoramaViewer(){
+    const stage = document.getElementById('panoramaStage');
+    const frame = document.getElementById('previewFrame');
+    const canvas = document.getElementById('panoramaCanvas');
+    if(!stage) return;
+    const ratio = panoramaRatioValue();
+    const aspect = Math.max(0.08, Math.min(12, ratio.w / ratio.h));
+    const maxW = Math.max(260, Math.min(1180, window.innerWidth - 116));
+    const maxH = Math.max(220, Math.min(780, window.innerHeight - 220));
+    let w = maxW;
+    let h = w / aspect;
+    if(h > maxH){
+        h = maxH;
+        w = h * aspect;
+    }
+    w = Math.max(160, Math.round(w));
+    h = Math.max(160, Math.round(h));
+    stage.style.width = `${w}px`;
+    stage.style.height = `${h}px`;
+    stage.style.aspectRatio = `${ratio.w} / ${ratio.h}`;
+    if(frame){
+        frame.style.width = `${w}px`;
+        frame.style.height = `${h}px`;
+    }
+    if(canvas){
+        const render = panoramaResolutionValue();
+        const nextW = Math.max(1, Math.round(render.w));
+        const nextH = Math.max(1, Math.round(render.h));
+        if(canvas.width !== nextW) canvas.width = nextW;
+        if(canvas.height !== nextH) canvas.height = nextH;
+    }
+}
+function disposePanoramaTexture(){
+    panoramaState.texture = null;
+    panoramaState.image = null;
+}
+async function loadPanoramaTexture(src, allowFallback=true){
+    if(!src) return;
+    const token = ++panoramaState.loadToken;
+    const stage = document.getElementById('panoramaStage');
+    stage?.classList.remove('ready');
+    const ready = await ensurePanoramaRenderer();
+    if(!ready){
+        stage?.classList.add('ready');
+        toast(tr('smart.panoramaLoadFailed'));
+        return;
+    }
+    if(token !== panoramaState.loadToken) return;
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    const fallback = allowFallback ? panoramaFallbackSource() : '';
+    const done = () => {
+        if(token !== panoramaState.loadToken){
+            return;
+        }
+        disposePanoramaTexture();
+        panoramaState.image = img;
+        panoramaState.loadedSrc = src;
+        stage?.classList.add('ready');
+        resizePanoramaViewer();
+        startPanoramaLoop();
+    };
+    const fail = () => {
+        if(token !== panoramaState.loadToken) return;
+        if(fallback && fallback !== src){
+            loadPanoramaTexture(fallback, false);
+            return;
+        }
+        stage?.classList.add('ready');
+        toast(tr('smart.panoramaLoadFailed'));
+    };
+    img.onload = done;
+    img.onerror = fail;
+    img.src = src;
+    if(img.complete && img.naturalWidth) done();
+}
+function refreshPanoramaControls(){
+    const controls = document.getElementById('panoramaControls');
+    const custom = document.getElementById('panoramaCustomRatio');
+    if(controls) controls.style.display = panoramaState.enabled ? 'inline-flex' : 'none';
+    if(custom) custom.style.display = panoramaState.enabled && panoramaState.ratio === 'custom' ? 'inline-flex' : 'none';
+    document.querySelectorAll('[data-panorama-ratio]').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.panoramaRatio === panoramaState.ratio);
+    });
+    const w = document.getElementById('panoramaRatioW');
+    const h = document.getElementById('panoramaRatioH');
+    if(w && document.activeElement !== w) w.value = panoramaState.customW;
+    if(h && document.activeElement !== h) h.value = panoramaState.customH;
+}
+function setPanoramaEnabled(enabled){
+    const next = Boolean(enabled);
+    if(panoramaState.enabled === next) return;
+    panoramaState.enabled = next;
+    const stage = document.getElementById('previewStage');
+    const pano = document.getElementById('panoramaStage');
+    const currentImg = document.getElementById('previewCurrentImage');
+    const compareLayer = document.getElementById('previewCompareLayer');
+    const compareHandle = document.getElementById('previewCompareHandle');
+    const toggle = document.getElementById('panoramaToggleBtn');
+    const exportBtn = document.getElementById('panoramaExportBtn');
+    const compareToggle = document.getElementById('compareToggleBtn');
+    const compareThumbs = document.getElementById('compareThumbs');
+    const previewTools = document.getElementById('imagePreviewTools');
+    stage?.classList.toggle('panorama-on', next);
+    previewTools?.classList.toggle('panorama-tools-on', next);
+    if(pano) pano.style.display = next ? 'block' : 'none';
+    if(currentImg) currentImg.style.display = next ? 'none' : 'block';
+    if(compareLayer && next) compareLayer.style.display = 'none';
+    if(compareHandle && next) compareHandle.style.display = 'none';
+    if(toggle) toggle.classList.toggle('active', next);
+    if(exportBtn) exportBtn.style.display = next ? 'inline-flex' : 'none';
+    if(compareToggle) compareToggle.style.display = next ? 'none' : 'inline-flex';
+    if(compareThumbs && next){ compareThumbs.style.display = 'none'; compareThumbs.innerHTML = ''; }
+    previewCompareOn = next ? false : previewCompareOn;
+    if(next){
+        previewPan = {x:0, y:0};
+        previewZoom = 1.0;
+        applyPreviewTransform();
+        resizePanoramaViewer();
+        loadPanoramaTexture(panoramaSource());
+        updatePreviewMetaHint(tr('smart.panoramaHint'));
+    } else {
+        stopPanoramaLoop();
+        const frame = document.getElementById('previewFrame');
+        if(frame){ frame.style.width = ''; frame.style.height = ''; }
+        refreshComparePanel();
+    }
+    refreshPanoramaControls();
+    updateZoomLabel();
+}
+function togglePanoramaPreview(){
+    const image = currentEditImage().image || {};
+    if(mediaKindForItem(image) !== 'image') return;
+    setPanoramaEnabled(!panoramaState.enabled);
+}
+async function exportPanoramaFrame(){
+    if(!panoramaState.enabled) return;
+    const canvasEl = document.getElementById('panoramaCanvas');
+    if(!canvasEl){ toast(tr('smart.panoramaExportFailed')); return; }
+    try {
+        if(!drawPanoramaFrame()) throw new Error(tr('smart.panoramaExportFailed'));
+        const blob = await new Promise(resolve => canvasEl.toBlob(resolve, 'image/png'));
+        if(!blob) throw new Error(tr('smart.panoramaExportFailed'));
+        const editing = currentEditImage();
+        const rawName = editing.image?.name || fileNameFromUrl(editing.image?.url || '') || 'panorama';
+        const base = String(rawName).replace(/\.[a-z0-9]{2,8}$/i, '') || 'panorama';
+        const filename = safeExportFileName(`${base}-panorama.png`, 'panorama.png');
+        const uploaded = await uploadFiles([new File([blob], filename, {type:'image/png'})]);
+        const frame = uploaded[0];
+        if(!frame?.url) throw new Error(tr('smart.panoramaExportFailed'));
+        frame.kind = 'image';
+        frame.natural_w = canvasEl.width;
+        frame.natural_h = canvasEl.height;
+        const rect = editing.node ? nodeRect(editing.node) : null;
+        const point = rect
+            ? {x:rect.x + rect.width + 240, y:rect.y + rect.height / 2}
+            : viewportCenter();
+        pushUndo();
+        const newNode = createImageNodeAt(point, [frame], {select:true, skipUndo:true});
+        selectedIds = [];
+        selectedImage = {nodeId:newNode.id, index:0};
+        render();
+        scheduleSave();
+        toast(tr('smart.panoramaExportDone'));
+    } catch(e) {
+        toast((e.message || tr('smart.panoramaExportFailed')).slice(0, 120));
+    }
+}
+function resetPanoramaView(){
+    panoramaState.fov = 75;
+    panoramaState.yaw = 0;
+    panoramaState.pitch = 0;
+    resizePanoramaViewer();
+    updateZoomLabel();
+}
+function disposePanoramaPreview(){
+    stopPanoramaLoop();
+    disposePanoramaTexture();
+    panoramaState.enabled = false;
+    panoramaState.drag = null;
+    panoramaState.loadedSrc = '';
+    panoramaState.loadToken++;
+    const stage = document.getElementById('panoramaStage');
+    stage?.classList.remove('ready');
+    if(stage) stage.style.display = 'none';
+    document.getElementById('previewStage')?.classList.remove('panorama-on', 'panning');
+    document.getElementById('imagePreviewTools')?.classList.remove('panorama-tools-on');
+    document.getElementById('panoramaControls')?.style.setProperty('display', 'none');
+    document.getElementById('panoramaToggleBtn')?.classList.remove('active');
+    document.getElementById('panoramaExportBtn')?.style.setProperty('display', 'none');
+}
+function applyPanoramaRatio(value){
+    panoramaState.ratio = PANORAMA_RATIO_PRESETS[value] ? value : 'custom';
+    refreshPanoramaControls();
+    resizePanoramaViewer();
 }
 function setPreviewComparePos(clientX){
     const frame = document.getElementById('previewFrame');
@@ -5638,6 +6012,10 @@ function setPreviewComparePos(clientX){
 }
 function syncPreviewFrameSize(){
     const frame = document.getElementById('previewFrame');
+    if(panoramaState.enabled){
+        resizePanoramaViewer();
+        return;
+    }
     const currentImg = document.getElementById('previewCurrentImage');
     const currentVideo = document.getElementById('previewCurrentVideo');
     const compareImg = document.getElementById('previewCompareImage');
@@ -5720,9 +6098,26 @@ function refreshComparePanel(){
     const compareHandle = document.getElementById('previewCompareHandle');
     const thumbsEl = document.getElementById('compareThumbs');
     const toggle = document.getElementById('compareToggleBtn');
+    const panoramaToggle = document.getElementById('panoramaToggleBtn');
     const editing = currentEditImage();
     const curUrl = editing.image?.url || '';
     const isVideoPreview = mediaKindForItem(editing.image || {}) === 'video';
+    if(panoramaToggle){
+        panoramaToggle.style.display = isVideoPreview ? 'none' : 'inline-flex';
+        panoramaToggle.classList.toggle('active', panoramaState.enabled);
+    }
+    if(panoramaState.enabled && !isVideoPreview){
+        currentImg.onload = null;
+        currentImg.onerror = null;
+        currentImg.style.display = 'none';
+        stage?.classList.remove('compare-on');
+        if(compareLayer) compareLayer.style.display = 'none';
+        if(compareHandle) compareHandle.style.display = 'none';
+        if(thumbsEl){ thumbsEl.style.display = 'none'; thumbsEl.innerHTML = ''; }
+        if(toggle) toggle.classList.remove('active');
+        updatePreviewMetaHint(tr('smart.panoramaHint'));
+        return;
+    }
     const onCurrentLoaded = () => {
         rememberPreviewImageResolution();
         syncPreviewFrameSize();
@@ -5756,6 +6151,7 @@ function refreshComparePanel(){
             toggle.classList.remove('active');
             toggle.title = tr('smart.compareEmpty');
         }
+        if(panoramaToggle) panoramaToggle.style.display = 'none';
         updatePreviewMetaHint(editing.node?.runPrompt ? `${tr('smart.runPromptPrefix')}${editing.node.runPrompt.slice(0, 60)}` : '');
         return;
     }
@@ -6280,6 +6676,10 @@ function syncImageEditOverflow(){
 }
 function resetImageEditZoom(){
     if(imageEditMode === 'preview'){
+        if(panoramaState.enabled){
+            resetPanoramaView();
+            return;
+        }
         resetPreviewTransform();
         return;
     }
@@ -6289,7 +6689,12 @@ function resetImageEditZoom(){
 }
 function updateZoomLabel(){
     const el = document.getElementById('imageEditZoomLabel');
-    if(el) el.textContent = Math.round((imageEditMode === 'preview' ? previewZoom : imageEditZoom) * 100) + '%';
+    if(!el) return;
+    if(imageEditMode === 'preview' && panoramaState.enabled){
+        el.textContent = Math.round((75 / Math.max(1, panoramaState.fov)) * 100) + '%';
+        return;
+    }
+    el.textContent = Math.round((imageEditMode === 'preview' ? previewZoom : imageEditZoom) * 100) + '%';
 }
 function syncGridCustomCursor(){
     const el = document.getElementById('cropCanvas');
@@ -6469,6 +6874,7 @@ function openImageEditor(nodeId, imageIndex=0){
     imageEditModal.classList.add('open');
     previewCompareOn = false;
     previewCompareIndex = -1;
+    disposePanoramaPreview();
     resetPreviewTransform();
     if(kind === 'video'){
         img.onload = null;
@@ -6527,6 +6933,7 @@ function closeImageEditor(){
     cropState = null; cropDrag = null; editDrawState = null; resetEditDrawingHistory(); gridCustomDrag = null;
     previewNavState = {nodeId:'', index:0, count:0};
     imageEditZoom = 1.0; imageEditBaseW = 0; imageEditBaseH = 0; imageEditModeTouched = false;
+    disposePanoramaPreview();
     previewPanDrag = null; previewCompareDrag = false; imageEditPanDrag = null; resetPreviewTransform();
     document.getElementById('imageEditStage')?.classList.remove('overflow-x', 'overflow-y', 'preview-mode');
     const cropCanvasEl = document.getElementById('cropCanvas');
@@ -9867,6 +10274,7 @@ async function resumeSmartPendingNode(node){
     node.pending = Math.max(tasks.length, Number(node.pending || 0) || tasks.length);
     node.running = false;
     render();
+    const failures = [];
     await Promise.all(tasks.map(async task => {
         try {
             const result = await pollSmartCanvasTask(task.taskId);
@@ -9884,11 +10292,15 @@ async function resumeSmartPendingNode(node){
                     delete node.h;
                 }
             }
+            failures.push(e);
             toast((e.message || tr('smart.errRunFailed')).slice(0, 160));
             render();
             scheduleSave();
         }
     }));
+    if(failures.length && !(node.images || []).length){
+        throw failures[0];
+    }
 }
 function resumeSmartPendingTasks(){
     nodes.filter(node => smartPendingTasks(node).length).forEach(node => {
@@ -10142,6 +10554,15 @@ window.onmousemove = e => {
         setPreviewComparePos(e.clientX);
         return;
     }
+    if(panoramaState.drag){
+        e.preventDefault();
+        const dx = e.clientX - panoramaState.drag.clientX;
+        const dy = e.clientY - panoramaState.drag.clientY;
+        panoramaState.yaw = panoramaState.drag.yaw - dx * 0.18;
+        panoramaState.pitch = Math.max(-85, Math.min(85, panoramaState.drag.pitch + dy * 0.18));
+        document.getElementById('previewStage')?.classList.add('panning');
+        return;
+    }
     if(previewPanDrag){
         const stage = document.getElementById('previewStage');
         previewPan = {
@@ -10278,6 +10699,10 @@ window.onmouseup = e => {
     if(promptResizeState){ promptResizeState = null; scheduleSave(); }
     if(selectionState) finishSelection(e);
     if(previewCompareDrag) previewCompareDrag = false;
+    if(panoramaState.drag){
+        panoramaState.drag = null;
+        document.getElementById('previewStage')?.classList.remove('panning');
+    }
     if(previewPanDrag){
         previewPanDrag = null;
         document.getElementById('previewStage')?.classList.remove('panning');
@@ -10884,7 +11309,7 @@ imageEditModal.addEventListener('mousedown', event => {
     event.stopPropagation();
 });
 imageEditModal.addEventListener('mousemove', event => {
-    if(previewPanDrag || previewCompareDrag || imageEditPanDrag || cropDrag) return;
+    if(previewPanDrag || previewCompareDrag || panoramaState.drag || imageEditPanDrag || cropDrag) return;
     event.stopPropagation();
 });
 imageEditModal.addEventListener('click', event => {
@@ -10901,6 +11326,16 @@ document.getElementById('previewStage').addEventListener('mousedown', event => {
     if(event.target.closest('video')) return;
     event.preventDefault();
     event.stopPropagation();
+    if(panoramaState.enabled){
+        panoramaState.drag = {
+            clientX:event.clientX,
+            clientY:event.clientY,
+            yaw:panoramaState.yaw,
+            pitch:panoramaState.pitch
+        };
+        document.getElementById('previewStage')?.classList.add('panning');
+        return;
+    }
     previewPanDrag = {clientX:event.clientX, clientY:event.clientY, startX:previewPan.x, startY:previewPan.y};
 });
 document.getElementById('imageEditStage').addEventListener('mousedown', event => {
@@ -10984,12 +11419,34 @@ document.getElementById('editTextCanvas')?.addEventListener('dblclick', event =>
         refreshGridSplitPreview();
     });
 });
+document.querySelectorAll('[data-panorama-ratio]').forEach(btn => {
+    btn.addEventListener('click', event => {
+        event.preventDefault();
+        event.stopPropagation();
+        applyPanoramaRatio(btn.dataset.panoramaRatio || 'wide');
+    });
+});
+['panoramaRatioW','panoramaRatioH'].forEach(id => {
+    document.getElementById(id)?.addEventListener('input', () => {
+        panoramaState.ratio = 'custom';
+        panoramaState.customW = Math.max(1, Math.min(999, Number(document.getElementById('panoramaRatioW')?.value || 16)));
+        panoramaState.customH = Math.max(1, Math.min(999, Number(document.getElementById('panoramaRatioH')?.value || 9)));
+        refreshPanoramaControls();
+        resizePanoramaViewer();
+    });
+});
 document.getElementById('imageEditStage').addEventListener('wheel', event => {
     if(!cropState) return;
     event.preventDefault();
     event.stopPropagation();
     if(imageEditMode === 'preview'){
         if(seekPreviewVideoFrames(event.deltaY > 0 ? 1 : -1)) return;
+        if(panoramaState.enabled){
+            const factor = event.deltaY < 0 ? 0.92 : 1 / 0.92;
+            panoramaState.fov = Math.max(35, Math.min(100, panoramaState.fov * factor));
+            updateZoomLabel();
+            return;
+        }
         const oldZoom = previewZoom;
         const factor = event.deltaY < 0 ? 1.12 : 1 / 1.12;
         previewZoom = Math.max(0.05, previewZoom * factor);
@@ -11019,7 +11476,10 @@ document.getElementById('imageEditStage').addEventListener('wheel', event => {
     stage.scrollLeft = contentX * scale - mx;
     stage.scrollTop = contentY * scale - my;
 }, {passive:false});
-window.addEventListener('resize', () => { if(cropState) syncImageEditOverflow(); });
+window.addEventListener('resize', () => {
+    if(cropState) syncImageEditOverflow();
+    if(panoramaState.enabled) resizePanoramaViewer();
+});
 window.addEventListener('studio-theme-change', event => applyTheme(event.detail?.theme || 'light'));
 try {
     const apiChannel = new BroadcastChannel('studio-api');
@@ -11027,6 +11487,7 @@ try {
         if(event.data?.type === 'providers-changed' || event.data?.type === 'workflows-changed' || event.data?.type === 'comfy-instances-changed'){
             await refreshSmartConfigFromSettings();
         }
+        if(event.data?.type === 'asset_library_updated') handleAssetLibraryUpdatedMessage(event.data);
     };
 } catch(e) {}
 window.addEventListener('focus', () => {
@@ -11036,6 +11497,7 @@ window.addEventListener('message', event => {
     if(event.origin && event.origin !== location.origin) return;
     if(event.data?.type === 'studio-theme') applyTheme(event.data.theme || 'light');
     if(event.data?.type === 'providers-changed' || event.data?.type === 'workflows-changed' || event.data?.type === 'comfy-instances-changed') refreshSmartConfigFromSettings();
+    if(event.data?.type === 'asset_library_updated') handleAssetLibraryUpdatedMessage(event.data);
     if(event.data?.type === 'studio-lang' && window.StudioI18n) {
         window.StudioI18n.set(event.data.lang || 'zh');
     }
@@ -11058,6 +11520,7 @@ window.onload = async () => {
     await loadPromptTemplates();
     if(window.StudioI18n) window.StudioI18n.apply();
     if(window.lucide) lucide.createIcons();
+    connectAssetLibrarySyncSocket();
     await loadConfig();
     await loadAssetLibrary();
     await loadCanvas();
