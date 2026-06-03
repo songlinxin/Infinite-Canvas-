@@ -2780,6 +2780,12 @@ def is_runninghub_provider(provider):
 def is_jimeng_provider(provider):
     return provider_protocol(provider) == "jimeng" or str((provider or {}).get("id") or "").strip().lower() == "jimeng"
 
+def is_yuli_provider(provider):
+    # 玉玉API（yuli.host）的视频接口走自有格式（/v1/video/create + /v1/video/query），
+    # 与通用 OpenAI /v1/videos/generations 不同，需单独识别。
+    base_url = str((provider or {}).get("base_url") or "").lower()
+    return "yuli.host" in base_url
+
 # ---- 数字人/真人认证：平台无关分发 ----
 # 认证是一个跨平台功能。每个平台用不同的资产 API 实现，但对外是统一入口。
 # 新增平台时：在 avatar_platform_for_provider 里加一条识别，并把平台键加进
@@ -7706,6 +7712,8 @@ def video_submit_url_candidates(provider, base_url):
         return [f"{base_url}/videos/generations" if base_url.endswith("/v1") else f"{base_url}/v1/videos/generations"]
     if is_volcengine_provider(provider):
         return [f"{base_url}/api/v3/contents/generations/tasks"]
+    if is_yuli_provider(provider):
+        return [f"{base_url}/v1/video/create"]
     return [f"{base_url}/v1/videos/generations", f"{base_url}/v2/videos/generations"]
 
 def video_task_url_candidates(provider, base_url, task_id, submit_url=""):
@@ -7714,6 +7722,10 @@ def video_task_url_candidates(provider, base_url, task_id, submit_url=""):
         return [f"{task_path}?language=zh"]
     if is_volcengine_provider(provider):
         return [f"{base_url}/api/v3/contents/generations/tasks/{task_id}"]
+    if is_yuli_provider(provider):
+        # 玉玉API 两种视频格式：OpenAI（/v1/videos/{id}）与原生（/v1/video/query?id=）。
+        # 两个都试，谁返回成功就用谁，兼容 veo OpenAI 路径与 doubao 原生路径。
+        return [f"{base_url}/v1/videos/{task_id}", f"{base_url}/v1/video/query?id={task_id}"]
     v1_task = f"{base_url}/v1/videos/generations/{task_id}"
     v1_generic_task = f"{base_url}/v1/tasks/{task_id}"
     v2_task = f"{base_url}/v2/videos/generations/{task_id}"
@@ -7729,6 +7741,32 @@ VIDEO_TASK_FAILURE_STATUSES = {
     "FAILURE", "FAILED", "FAIL", "ERROR", "ERRORED",
     "CANCELED", "CANCELLED", "TIMEOUT", "TIMEDOUT", "REJECTED", "EXPIRED",
 }
+
+def humanize_video_task_failure(reason) -> str:
+    """把上游视频任务的失败原因转成对用户友好的中文提示。
+    目前主要处理 veo（Google）的内容安全过滤码。"""
+    text = str(reason or "").strip()
+    upper = text.upper()
+    # veo 知名人物/真人面孔过滤
+    if "PROMINENT_PEOPLE_FILTER" in upper or "PROMINENT_PEOPLE" in upper:
+        return (
+            "视频生成被上游内容安全策略拦截：检测到提示词或参考图里包含知名人物 / 真人面孔"
+            f"（错误码：{text}）。\n\n"
+            "这不是代码错误，而是 veo（Google）的内容审核规则——它会拒绝生成涉及真实/知名人物的视频。\n\n"
+            "建议这样处理：\n"
+            "  1. 去掉提示词里的人名、明星、公众人物等指向具体真人的描述；\n"
+            "  2. 换用非真人参考图，例如插画、AI 头像、卡通形象、商品图、场景图；\n"
+            "  3. 如果用了真人照片做参考图，先做模糊/遮挡/转成明显的二次元插画风，或干脆只用文字提示词测试。"
+        )
+    # veo 其它常见安全过滤
+    if "SAFETY" in upper or "CONTENT_FILTER" in upper or "POLICY" in upper:
+        return (
+            "视频生成被上游内容安全策略拦截"
+            f"（错误码：{text}）。\n\n"
+            "这是 veo 的内容审核规则，提示词或参考图触发了安全过滤。\n"
+            "请调整提示词/参考图后重试，避免涉及真人、暴力、敏感或受限内容。"
+        )
+    return f"视频生成任务失败：{text}"
 
 async def wait_for_video_task(client, provider, task_id, submit_url=""):
     base_url = video_api_root(provider)
@@ -7760,13 +7798,14 @@ async def wait_for_video_task(client, provider, task_id, submit_url=""):
         status = str(task_data.get("status") or task_data.get("task_status") or raw.get("status") or raw.get("task_status") or "").upper()
         if status in VIDEO_TASK_SUCCESS_STATUSES:
             return raw
-        # 部分上游不返回标准 status 字段，但已经返回了视频 URL —— 直接当成功处理
-        if not status and video_output_urls(raw):
+        # 部分上游（如玉玉API）status 字段非标准或为空，但已经返回了视频 URL ——
+        # 只要不是明确的失败状态，且拿到了真实视频地址，就直接当成功处理。
+        if status not in VIDEO_TASK_FAILURE_STATUSES and video_output_urls(raw):
             return raw
         if status in VIDEO_TASK_FAILURE_STATUSES:
             error = task_data.get("error") if isinstance(task_data.get("error"), dict) else {}
             reason = task_data.get("fail_reason") or task_data.get("message") or error.get("message") or raw.get("error") or raw.get("message") or str(raw)
-            raise HTTPException(status_code=502, detail=f"视频生成任务失败：{reason}")
+            raise HTTPException(status_code=502, detail=humanize_video_task_failure(reason))
         delay = min(delay * 1.6, 12)
     raise HTTPException(status_code=504, detail=f"视频生成任务超时：{last_payload or task_id}")
 
@@ -7776,6 +7815,108 @@ def apimart_video_size(size):
         return "adaptive"
     allowed = {"16:9", "9:16", "1:1", "4:3", "3:4", "21:9", "adaptive"}
     return value if value in allowed else "16:9"
+
+# ---- 玉玉API（yuli.host）OpenAI 视频格式：/v1/videos（multipart，支持 seconds 时长）----
+def _yuli_model_norm(model: str) -> str:
+    return str(model or "").strip().lower().replace("_", "").replace(".", "").replace("-", "")
+
+def yuli_is_veo_openai_model(model: str) -> bool:
+    # OpenAI multipart 格式当前只支持 veo_3_1 和 veo_3_1-fast
+    return _yuli_model_norm(model) in {"veo31", "veo31fast"}
+
+def yuli_openai_model_name(model: str) -> str:
+    return "veo_3_1-fast" if _yuli_model_norm(model) == "veo31fast" else "veo_3_1"
+
+def yuli_openai_size(aspect_ratio: str) -> str:
+    value = str(aspect_ratio or "").strip()
+    if value == "9:16":
+        return "9x16"
+    return "16x9"
+
+def yuli_video_seconds(duration) -> str:
+    try:
+        value = int(duration)
+    except Exception:
+        value = 8
+    if value <= 0:
+        value = 8
+    return str(value)
+
+async def yuli_fetch_reference_bytes(client, ref_url):
+    """把参考图（input_reference 垫图）取成 (filename, bytes, mime)，
+    支持 /output、/assets 本地文件、data URL、http(s) URL。失败返回 None。"""
+    ref_url = str(ref_url or "").strip()
+    if not ref_url:
+        return None
+    if ref_url.startswith("data:"):
+        header, _, b64 = ref_url.partition(",")
+        mime = (header[5:].split(";")[0] or "image/png").strip()
+        try:
+            raw = base64.b64decode(b64)
+        except Exception:
+            return None
+        ext = (mime.split("/")[-1] or "png").split("+")[0]
+        return (f"input_reference.{ext}", raw, mime)
+    path = output_file_from_url(ref_url)
+    if path:
+        try:
+            with open(path, "rb") as f:
+                raw = f.read()
+        except Exception:
+            return None
+        mime = content_type_for_path(path)
+        return (os.path.basename(path) or "input_reference", raw, mime)
+    if ref_url.startswith("http://") or ref_url.startswith("https://"):
+        try:
+            resp = await client.get(ref_url)
+            resp.raise_for_status()
+            raw = resp.content
+        except Exception:
+            return None
+        mime = (resp.headers.get("content-type") or "image/png").split(";")[0].strip()
+        ext = (mime.split("/")[-1] or "png").split("+")[0]
+        return (f"input_reference.{ext}", raw, mime)
+    return None
+
+async def generate_yuli_openai_video(client, payload, provider, base_url, requested_model):
+    """玉玉API veo3.1 走 OpenAI multipart 格式 /v1/videos，支持 seconds 时长控制。"""
+    submit_url = f"{base_url}/v1/videos"
+    data = {
+        "model": yuli_openai_model_name(requested_model),
+        "prompt": str(payload.prompt or ""),
+        "seconds": yuli_video_seconds(payload.duration),
+        "size": yuli_openai_size(payload.aspect_ratio),
+        "watermark": "true" if payload.watermark else "false",
+    }
+    files = {}
+    for ref in (payload.images or [])[:1]:
+        ref_file = await yuli_fetch_reference_bytes(client, getattr(ref, "url", ""))
+        if ref_file:
+            files["input_reference"] = ref_file
+            break
+    headers = api_headers(json_body=False, provider=provider)
+    if files:
+        response = await client.post(submit_url, headers=headers, data=data, files=files)
+    else:
+        # 文生视频无垫图时，仍以 multipart/form-data 提交（把文本字段作为表单分块），
+        # 避免 httpx 在只有 data 时退化成 application/x-www-form-urlencoded。
+        multipart_fields = {key: (None, value) for key, value in data.items()}
+        response = await client.post(submit_url, headers=headers, files=multipart_fields)
+    response.raise_for_status()
+    try:
+        raw = response.json()
+    except Exception as exc:
+        resp_text = (response.text or "")[:500]
+        raise HTTPException(status_code=502, detail=f"玉玉API 视频接口返回非 JSON 响应（状态 {response.status_code}）：{resp_text}") from exc
+    task_id = raw.get("id") or extract_task_id(raw) or raw.get("task_id")
+    result = raw
+    if task_id and not video_output_urls(raw):
+        result = await wait_for_video_task(client, provider, task_id, submit_url)
+    urls = video_output_urls(result)
+    if not urls:
+        raise HTTPException(status_code=502, detail=f"视频生成成功但没有返回视频：{result}")
+    local_urls = [await save_remote_video_to_output(url) for url in urls]
+    return {"videos": local_urls, "task_id": task_id, "raw": result}
 
 def volcengine_video_prompt_text(prompt, aspect_ratio="", duration=None):
     text = str(prompt or "").strip()
@@ -7801,10 +7942,22 @@ async def canvas_video(payload: CanvasVideoRequest):
         raise HTTPException(status_code=400, detail=f"未配置 {provider.get('name') or provider['id']} 的 API Key，请在 API 设置中填写。")
     is_apimart = is_apimart_provider(provider)
     is_volcengine = is_volcengine_provider(provider)
+    is_yuli = is_yuli_provider(provider)
     submit_urls = video_submit_url_candidates(provider, base_url)
     submit_url = submit_urls[0]
     requested_model = selected_model(payload.model, "veo3-fast")
     is_veo31 = is_apimart and is_apimart_veo31_model(requested_model)
+    # 玉玉API veo3.1 走 OpenAI multipart 格式（支持 seconds 时长）；其余模型（doubao 等）
+    # 沿用下方原生 /v1/video/create JSON 流程。
+    if is_yuli and yuli_is_veo_openai_model(requested_model):
+        try:
+            async with httpx.AsyncClient(timeout=VIDEO_POLL_TIMEOUT) as yuli_client:
+                return await generate_yuli_openai_video(yuli_client, payload, provider, base_url, requested_model)
+        except httpx.HTTPStatusError as exc:
+            text = exc.response.text
+            raise HTTPException(status_code=exc.response.status_code, detail=f"上游视频接口错误：{text}") from exc
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail=f"请求上游视频接口失败：{exc}") from exc
     try:
         async with httpx.AsyncClient(timeout=VIDEO_POLL_TIMEOUT) as client:
             # --- 构造图片载荷 ---
@@ -8002,6 +8155,39 @@ async def canvas_video(payload: CanvasVideoRequest):
                         )
                     if payload.seed is not None:
                         body["seed"] = payload.seed
+                elif is_yuli:
+                    # 玉玉API（yuli.host）视频走自有 veo 统一格式：POST /v1/video/create。
+                    # 字段：model / prompt / images[]（http(s) URL）/ enhance_prompt /
+                    # enable_upsample / aspect_ratio（仅 16:9、9:16）。无 duration 字段，
+                    # 时长由模型本身决定，所以这里不传 duration/seconds。
+                    yuli_images = []
+                    for ref in payload.images[:3]:
+                        ref_url = str(getattr(ref, "url", "") or "").strip()
+                        if not ref_url:
+                            continue
+                        if ref_url.startswith("http://") or ref_url.startswith("https://"):
+                            yuli_images.append(ref_url)
+                        else:
+                            # 本地/dataURL 图片转成 data URL 兜底传递
+                            data_url = reference_to_data_url(ref.dict(), max_size=1536)
+                            if data_url:
+                                yuli_images.append(data_url)
+                    prompt_text = str(payload.prompt or "")
+                    # veo 只支持英文提示词：仅在含中文等非 ASCII 字符时才开启翻译增强，
+                    # 纯英文原样传递（避免增强改写时引入人物等触发安全过滤的描述）。
+                    needs_enhance = any(ord(ch) > 127 for ch in prompt_text)
+                    body = {
+                        "model": selected_model(payload.model, "veo3.1-fast"),
+                        "prompt": prompt_text,
+                        "enhance_prompt": needs_enhance,
+                    }
+                    if yuli_images:
+                        body["images"] = yuli_images
+                    ratio = str(payload.aspect_ratio or "").strip()
+                    if ratio in {"16:9", "9:16"}:
+                        body["aspect_ratio"] = ratio
+                    if payload.enable_upsample:
+                        body["enable_upsample"] = True
                 else:
                     image_payload = []
                     for ref in payload.images[:4]:

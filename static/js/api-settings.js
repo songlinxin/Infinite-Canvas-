@@ -107,16 +107,6 @@ let recommendInlineOpen = false;
 let providerDragId = '';
 const RECOMMENDED_APIS = [
     {
-        name:'APIMART',
-        base_url:'https://api.apimart.ai',
-        protocol:'apimart',
-        register_url:'https://apimart.ai/zh/register?aff=1uyAbb',
-        tagKeys:['api.tagImageModels','api.tagVideoModels','api.tagLlmModels'],
-        icons:['IMG','VID','LLM'],
-        summaryKey:'api.recommendApimartSummary',
-        advantages:['模型类型覆盖广', '适合多节点混合工作流', '异步协议适合长任务']
-    },
-    {
         name:'玉玉API',
         base_url:'https://yuli.host',
         protocol:'openai',
@@ -129,8 +119,18 @@ const RECOMMENDED_APIS = [
         // 添加平台时预填的默认模型列表（含逐模型协议覆盖）
         image_models:['gpt-image-2', 'gemini-3.1-flash-image-preview', 'gemini-3-pro-image-preview'],
         chat_models:['gpt-5.5'],
-        video_models:['veo3.1-fast', 'doubao-seed-2-0-lite-260428', 'doubao-seed-2-0-mini-260428'],
+        video_models:['veo3.1-fast'],
         model_protocols:{'gemini-3.1-flash-image-preview':'gemini', 'gemini-3-pro-image-preview':'gemini'}
+    },
+    {
+        name:'APIMART',
+        base_url:'https://api.apimart.ai',
+        protocol:'apimart',
+        register_url:'https://apimart.ai/zh/register?aff=1uyAbb',
+        tagKeys:['api.tagImageModels','api.tagVideoModels','api.tagLlmModels'],
+        icons:['IMG','VID','LLM'],
+        summaryKey:'api.recommendApimartSummary',
+        advantages:['模型类型覆盖广', '适合多节点混合工作流', '异步协议适合长任务']
     },
     {
         name:'FHL',

@@ -59,8 +59,12 @@ html.studio-theme-dark body .api-link-btn:hover { background:#ffffff; border-col
 .recommend-card:hover { border-color:var(--line-strong); box-shadow:0 14px 30px rgba(15,23,42,.1); }
 .recommend-name { display:flex; align-items:center; justify-content:space-between; gap:10px; color:var(--text); font-size:16px; font-weight:950; letter-spacing:.02em; }
 .recommend-badge { height:22px; padding:0 8px; border-radius:999px; background:var(--soft); color:var(--muted); border:1px solid var(--line); display:inline-flex; align-items:center; font-size:10px; font-weight:850; white-space:nowrap; }
-.recommend-tags { display:flex; gap:6px; flex-wrap:wrap; }
-.recommend-tag { height:24px; padding:0 8px; border-radius:8px; background:var(--soft); color:var(--text); border:1px solid var(--line); display:inline-flex; align-items:center; gap:4px; font-size:10.5px; font-weight:850; }
+/* 「推荐API」按钮图标小跳动动画 */
+.api-link-btn i, .api-link-btn svg { animation:apiLinkBounce 1.4s ease-in-out infinite; transform-origin:center bottom; }
+.api-link-btn:hover i, .api-link-btn:hover svg { animation-play-state:paused; }
+@keyframes apiLinkBounce { 0%,100% { transform:translateY(0); } 30% { transform:translateY(-3px); } 55% { transform:translateY(0); } 70% { transform:translateY(-1.5px); } }
+.recommend-tags { display:flex; flex-wrap:wrap; align-items:center; gap:6px; }
+.recommend-tag { height:24px; padding:0 8px; border-radius:8px; background:var(--soft); color:var(--text); border:1px solid var(--line); display:inline-flex; align-items:center; gap:4px; font-size:10.5px; font-weight:850; line-height:1; white-space:nowrap; }
 /* 「签到送积分」胶囊：紫色边框 + 紫色文字，无动画，效果克制 */
 .recommend-tag.recommend-perk-tag { padding:0 10px !important; background:transparent !important; border:1px solid #8a3cff !important; color:#8a3cff !important; }
 .recommend-tag.recommend-perk-tag > span { color:#8a3cff !important; }
