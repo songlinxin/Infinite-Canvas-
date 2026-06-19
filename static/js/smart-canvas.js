@@ -1,5 +1,7 @@
 const params = new URLSearchParams(location.search);
 const canvasId = params.get('id') || '';
+const sourceProjectId = params.get('project') || '';
+const CANVAS_LIST_PROJECT_KEY = 'canvasListCurrentProjectId';
 const shell = document.getElementById('shell');
 const world = document.getElementById('world');
 const composer = document.getElementById('composer');
@@ -245,6 +247,8 @@ let gridJoinDrag = null;
 let gridJoinImageCache = new Map();
 let gridJoinUserMoved = false;
 let gridJoinOutputSize = 2048;
+// 非空时表示当前宫格拼接的数据源是整个分组（聚合组内所有图片成员），而不是单个节点。
+let gridJoinGroupId = '';
 let imageEditZoom = 1.0;
 let imageEditBaseW = 0;
 let imageEditBaseH = 0;
@@ -972,7 +976,19 @@ function persistActiveSmartSettings(){
     subject.runSettings = settingsForStorage(settings);
     rememberRecentSmartSettings(settings, subject);
 }
-function backToCanvasList(){ savePromptDraftForCurrent(); window.location.href = '/static/canvas.html?v=2026.05.22.1'; }
+function rememberCanvasListProject(projectId){
+    const pid = projectId || 'default';
+    try { localStorage.setItem(CANVAS_LIST_PROJECT_KEY, pid); } catch(e){}
+    return pid;
+}
+function canvasListUrlForProject(projectId){
+    const pid = rememberCanvasListProject(projectId);
+    return `/static/canvas-list.html?project=${encodeURIComponent(pid)}`;
+}
+function backToCanvasList(){
+    savePromptDraftForCurrent();
+    window.location.href = canvasListUrlForProject(canvas?.project || sourceProjectId || 'default');
+}
 function promptPlainText(){
     return originalPromptTextFromParts(collectPromptParts());
 }
@@ -1063,6 +1079,8 @@ const ZOOM_PREVIEW_NODE_DEFAULT_SCALE = 1;
 const ZOOM_PREVIEW_NODE_MAX_SCALE = 1.15;
 const MEDIA_GROUP_THUMB_BASE = 224;
 const MEDIA_GROUP_MAX_VISIBLE_ROWS = 3;
+// 智能分组卡片内的图片网格：超过这么多排就出现纵向滚动（区别于多图节点的 3 排）。
+const SMART_GROUP_MAX_VISIBLE_ROWS = 4;
 const EMPTY_UPLOAD_NODE_WIDTH = 316;
 const EMPTY_UPLOAD_NODE_HEIGHT = 194;
 const SMART_GROUP_DEFAULT_WIDTH = 340;
@@ -1071,8 +1089,8 @@ const SMART_GROUP_LEGACY_HEIGHT = 220;
 // 分组可缩小到的最小尺寸（缩小分组时组内图片随之等比缩小，靠这个区间产生缩放系数）。
 const SMART_GROUP_MIN_WIDTH = 150;
 const SMART_GROUP_MIN_HEIGHT = 130;
-// 组内成员的最大缩放（1=原始尺寸）：成员放大到此即封顶，分组可继续扩大但成员不再变大。
-const SMART_GROUP_MAX_MEMBER_ZOOM = 1;
+// 组内成员（提示词/循环）的最大缩放。已移除“放大不超过原始”的限制：向外拉分组时成员随之放大。
+const SMART_GROUP_MAX_MEMBER_ZOOM = 4;
 function mediaNodeDefaultScale(node){
     if((node?.images || []).length > 1 && !Number.isFinite(Number(node?.scale))) return MEDIA_GROUP_DEFAULT_SCALE;
     return Number.isFinite(Number(node?.scale)) && Number(node.scale) > 0 ? Number(node.scale) : MEDIA_NODE_DEFAULT_SCALE;
@@ -1118,13 +1136,41 @@ function scaleSmartGroupMemberToZoom(group, member, zoom){
     member.h = Math.max(40, Math.round((Number(r.height) || 0) * zoom));
     if(isSmartImageNode(member)) member.scale = 1;
 }
+// 把指向 fromId 的连线/输入引用改接到 toId（吸收图片入组后保留“来源 → 分组”的连线），并去重去自环。
+function rerouteSmartConnections(fromId, toId){
+    if(canvas){
+        canvas.connections = (canvas.connections || []).map(c => {
+            let conn = c;
+            if(c.from === fromId) conn = {...conn, from:toId};
+            if(c.to === fromId) conn = {...conn, to:toId};
+            return conn;
+        }).filter((c, i, arr) => c.from !== c.to && arr.findIndex(x => x.from === c.from && x.to === c.to && (x.kind || 'flow') === (c.kind || 'flow')) === i);
+    }
+    nodes.forEach(n => {
+        if(Array.isArray(n.inputNodeIds)) n.inputNodeIds = Array.from(new Set(n.inputNodeIds.map(id => id === fromId ? toId : id).filter(id => id !== n.id)));
+    });
+}
+// 把一张图片节点的图片吸收进分组（收进卡片内的缩略图网格），然后删除该图片节点。
+function absorbImageNodeIntoSmartGroup(group, child){
+    const add = (child.images || []).map(img => stripImageGenerationMeta({...img}));
+    if(!add.length) return false;
+    group.images = [...(group.images || []), ...add];
+    // 清掉显式尺寸，让缩略图网格按图片数自动整理排列（“放入图片自动整理”）。
+    delete group.w; delete group.h;
+    rerouteSmartConnections(child.id, group.id);
+    nodes = nodes.filter(n => n.id !== child.id);
+    nodes.forEach(g => { if(isSmartGroupNode(g) && Array.isArray(g.items)) g.items = g.items.filter(id => id !== child.id); });
+    return true;
+}
 function addNodeToSmartGroup(group, child){
     if(!isSmartGroupNode(group) || !child || child.id === group.id) return false;
     const items = Array.isArray(group.items) ? group.items.slice() : [];
     const zoom = smartGroupZoom(group);
     if(isSmartGroupNode(child)){
-        // 把一个分组拖进另一个分组：直接“释放”被拖的分组——只把它的成员（图片等节点）并入主分组，
-        // 然后删除被拖分组本体。等同于把那些节点逐个手动拖进来，避免嵌套分组带来的各种边角 bug。
+        // 把一个分组拖进另一个分组：吸收它的图片到本组网格，把它的非图片成员并入本组，然后删除被拖分组本体。
+        const mergedImages = (child.images || []).map(img => stripImageGenerationMeta({...img}));
+        group.images = [...(group.images || []), ...mergedImages];
+        if(mergedImages.length){ delete group.w; delete group.h; }
         const childMemberIds = smartGroupMembers(child)
             .map(m => m.id)
             .filter(id => id !== group.id && !items.includes(id));
@@ -1133,16 +1179,117 @@ function addNodeToSmartGroup(group, child){
             const m = nodes.find(n => n.id === id);
             if(m) scaleSmartGroupMemberToZoom(group, m, zoom);
         });
-        // 释放（删除）被拖入的分组本体；它的成员已经成为主分组成员。
+        rerouteSmartConnections(child.id, group.id);
         nodes = nodes.filter(n => n.id !== child.id);
-        if(canvas) canvas.connections = (canvas.connections || []).filter(c => c.from !== child.id && c.to !== child.id);
         nodes.forEach(g => { if(isSmartGroupNode(g) && Array.isArray(g.items)) g.items = g.items.filter(id => id !== child.id); });
         return true;
     }
+    // 图片节点：收进卡片内的缩略图网格（不再作为画布上的独立节点）。
+    if(isSmartImageNode(child)) return absorbImageNodeIntoSmartGroup(group, child);
+    // 提示词 / 循环：仍作为画布上的成员节点。
     if(items.includes(child.id)) return false;
     group.items = [...items, child.id];
-    // 新入组成员贴合分组当前缩放（分组已缩小时丢进来的成员也跟着变小）；只改尺寸、保持落点不跳动。
     scaleSmartGroupMemberToZoom(group, child, zoom);
+    return true;
+}
+// 找到把某个节点作为成员的智能分组（用于双击组内图片时按整组左右切换）。
+function smartGroupContainingNode(nodeId){
+    if(!nodeId) return null;
+    return nodes.find(n => isSmartGroupNode(n) && Array.isArray(n.items) && n.items.includes(nodeId)) || null;
+}
+// 节点所属的“分组作用域”ID：成员返回其分组，分组本体返回自身，否则空。
+// 用于连线合并/隐藏：同一作用域内部的连线属于分组内部关系，无需画出。
+function smartGroupScopeId(nodeId){
+    const group = smartGroupContainingNode(nodeId);
+    if(group) return group.id;
+    const node = nodes.find(n => n.id === nodeId);
+    return isSmartGroupNode(node) ? node.id : '';
+}
+// 汇总分组内所有图片成员的图片，按阅读顺序（先行后列：成员当前 y 再 x）排成一维序列。
+// 返回 [{nodeId, index, source, item}]——source 是成员节点里真实的图片对象（写回自然尺寸用），
+// item 是 imageForDisplay 后的展示对象。预览左右切换、批量下载、宫格拼接都以它为数据源。
+function smartGroupImageRefs(group){
+    if(!isSmartGroupNode(group)) return [];
+    const members = smartGroupMembers(group)
+        .filter(isSmartImageNode)
+        .slice()
+        .sort((a, b) => {
+            const ra = nodeRect(a), rb = nodeRect(b);
+            const dy = (Number(ra.y) || 0) - (Number(rb.y) || 0);
+            if(Math.abs(dy) > 24) return dy;
+            return (Number(ra.x) || 0) - (Number(rb.x) || 0);
+        });
+    const refs = [];
+    members.forEach(node => {
+        (node.images || []).forEach((img, index) => {
+            const item = imageForDisplay(img);
+            if(item?.url) refs.push({nodeId:node.id, index, source:img, item});
+        });
+    });
+    return refs;
+}
+const SMART_GROUP_ARRANGE_PADDING = 18;
+const SMART_GROUP_ARRANGE_GAP = 16;
+const SMART_GROUP_ARRANGE_HEADER = 44;
+// 把分组内的成员整理成整齐的网格（先行后列保持当前阅读顺序），列数尽量接近正方形，
+// 每个成员在所属单元格内居中；最后把分组框尺寸收敛到正好包住所有成员。
+function arrangeSmartGroupMembers(group, options={}){
+    if(!isSmartGroupNode(group)) return false;
+    // 图片已收进卡片内的缩略图网格，本身就是整齐自适应的，无需重排（“整理”对图片分组即重新渲染）。
+    if((group.images || []).some(img => img?.url)) return true;
+    const members = smartGroupMembers(group);
+    if(!members.length) return false;
+    if(!options.skipUndo) pushUndo();
+    const ordered = members.slice().sort((a, b) => {
+        const ra = nodeRect(a), rb = nodeRect(b);
+        const dy = (Number(ra.y) || 0) - (Number(rb.y) || 0);
+        if(Math.abs(dy) > 24) return dy;
+        return (Number(ra.x) || 0) - (Number(rb.x) || 0);
+    });
+    // 归一化图片成员尺寸：清掉入组缩放写入的 w/h，回到自然尺寸。否则反复拖出/拖入会越缩越小，
+    // 且“整理”无法恢复——这是用户反馈的“拖出再拖入图片变小、整理也救不回来”的根因。
+    ordered.forEach(node => {
+        if(isSmartImageNode(node)){
+            delete node.w;
+            delete node.h;
+        }
+    });
+    const sizes = ordered.map(node => {
+        const r = nodeRect(node);
+        return {node, w:Math.max(40, Number(r.width) || 120), h:Math.max(40, Number(r.height) || 120)};
+    });
+    const count = sizes.length;
+    const pad = SMART_GROUP_ARRANGE_PADDING;
+    const gap = SMART_GROUP_ARRANGE_GAP;
+    const headerH = SMART_GROUP_ARRANGE_HEADER;
+    const cols = Math.max(1, Math.min(count, Math.round(Math.sqrt(count)) || 1));
+    const rows = Math.ceil(count / cols);
+    const colW = new Array(cols).fill(0);
+    const rowH = new Array(rows).fill(0);
+    sizes.forEach((s, i) => {
+        const c = i % cols, r = Math.floor(i / cols);
+        colW[c] = Math.max(colW[c], s.w);
+        rowH[r] = Math.max(rowH[r], s.h);
+    });
+    const colX = [];
+    let accX = 0;
+    for(let c = 0; c < cols; c++){ colX[c] = accX; accX += colW[c] + gap; }
+    const rowY = [];
+    let accY = 0;
+    for(let r = 0; r < rows; r++){ rowY[r] = accY; accY += rowH[r] + gap; }
+    const originX = (Number(group.x) || 0) + pad;
+    const originY = (Number(group.y) || 0) + headerH + pad;
+    sizes.forEach((s, i) => {
+        const c = i % cols, r = Math.floor(i / cols);
+        s.node.x = Math.round(originX + colX[c] + (colW[c] - s.w) / 2);
+        s.node.y = Math.round(originY + rowY[r] + (rowH[r] - s.h) / 2);
+    });
+    const totalW = colW.reduce((a, b) => a + b, 0) + gap * (cols - 1) + pad * 2;
+    const totalH = rowH.reduce((a, b) => a + b, 0) + gap * (rows - 1) + pad * 2 + headerH;
+    group.w = Math.max(SMART_GROUP_MIN_WIDTH, Math.round(totalW));
+    group.h = Math.max(SMART_GROUP_MIN_HEIGHT, Math.round(totalH));
+    // 成员已回到自然尺寸，分组缩放基准随之归零，避免后续再缩放时跳变。
+    if(group._memberZoom !== undefined) group._memberZoom = 1;
     return true;
 }
 function mediaLayoutSize(img){
@@ -1347,8 +1494,41 @@ function promptNodeLayoutSize(node){
         : Math.max(explicitH, fallbackH);
     return {width:Math.round(width), height:Math.round(height)};
 }
+// 智能分组的图片网格布局：跟多图节点一致，但可见排数上限为 4（超过出现滚动），且缩略图无放大上限
+//（用户拉大分组时图片随之变大，不再封顶在原始尺寸）。
+function smartGroupImageGridLayout(node){
+    const images = (node?.images || []).filter(img => img?.url);
+    const count = images.length;
+    const s = mediaNodeDefaultScale(node);
+    if(count === 1){
+        const single = singleImageLayout(images[0], node, s);
+        const explicitW = Number(node?.w), explicitH = Number(node?.h);
+        const hasExplicit = Number.isFinite(explicitW) && explicitW > 24 && Number.isFinite(explicitH) && explicitH > 24;
+        // 容器有 16px 内边距（PAD=32）；无显式尺寸时把外框放大 PAD，以包住图片，避免“分组比图片还小”。
+        return hasExplicit ? single : {...single, width:single.width + 32, height:single.height + 32};
+    }
+    const baseThumb = Math.round(MEDIA_GROUP_THUMB_BASE * s);
+    const cell = baseThumb + 8;
+    const PAD = 32;
+    const explicitW = Number(node?.w);
+    const explicitH = Number(node?.h);
+    const cols = Math.min(4, Math.max(2, Math.ceil(Math.sqrt(count))));
+    const rows = Math.ceil(count / cols);
+    const visibleRows = Math.min(SMART_GROUP_MAX_VISIBLE_ROWS, rows);
+    if(Number.isFinite(explicitW) && explicitW > 40 && Number.isFinite(explicitH) && explicitH > 40){
+        // 用户拉伸过分组：按显式尺寸拟合，maxThumb 给一个极大值以解除“放大不超过原始”的限制。
+        const fitted = groupImageGridLayout(count, explicitW, explicitH, 100000, PAD, 8, SMART_GROUP_MAX_VISIBLE_ROWS);
+        return {cols:fitted.cols, rows:fitted.rows, visibleRows:fitted.visibleRows, width:Math.round(explicitW), height:fitted.visibleRows * (fitted.thumb + 8) - 8 + PAD, thumb:fitted.thumb};
+    }
+    const width = Math.max(Math.round(226 * s), cols * cell + PAD);
+    const height = visibleRows * cell - 8 + PAD;
+    return {cols, rows, visibleRows, width, height, thumb:baseThumb};
+}
 function imageLayout(images, scale=1, node=null){
-    if(node?.type === 'smart-group') return {cols:1, rows:1, ...smartGroupLayoutSize(node), thumb:96, single:true};
+    if(node?.type === 'smart-group'){
+        if((node.images || []).some(img => img?.url)) return smartGroupImageGridLayout(node);
+        return {cols:1, rows:1, ...smartGroupLayoutSize(node), thumb:96, single:true};
+    }
     if(node?.type === 'smart-prompt') return {cols:1, rows:1, ...promptNodeLayoutSize(node), thumb:96, single:true};
     if(node?.type === 'smart-loop') return {cols:1, rows:1, width:Math.round(Number(node.w) || smartLoopWidth(node)), height:Math.round(Math.max(Number(node.h) || 0, smartLoopHeight(node))), thumb:96, single:true};
     const count = (images || []).length;
@@ -4860,6 +5040,22 @@ function canvasImageDragPayload(node, index=0){
     if(!img?.url) return null;
     return {url:img.url, name:img.name || node.title || 'image'};
 }
+// 迁移旧数据：早期把图片节点作为成员（items[]）放进分组的画布，统一把这些图片吸收进 group.images，
+// 让它们显示为卡片内的缩略图网格（新模型）。一次性、幂等。
+function migrateSmartGroupImageMembers(){
+    let changed = false;
+    nodes.filter(isSmartGroupNode).forEach(group => {
+        const imageMemberIds = (Array.isArray(group.items) ? group.items : [])
+            .map(id => nodes.find(n => n.id === id))
+            .filter(m => m && isSmartImageNode(m) && (m.images || []).some(img => img?.url))
+            .map(m => m.id);
+        imageMemberIds.forEach(id => {
+            const member = nodes.find(n => n.id === id);
+            if(member && absorbImageNodeIntoSmartGroup(group, member)) changed = true;
+        });
+    });
+    return changed;
+}
 async function loadCanvas(){
     if(!canvasId) return;
     try {
@@ -4867,10 +5063,12 @@ async function loadCanvas(){
         if(!res.ok) return;
         const data = await res.json();
         canvas = data.canvas;
+        rememberCanvasListProject(canvas.project || 'default');
         canvasUsesConnections = Object.prototype.hasOwnProperty.call(canvas || {}, 'connections');
         document.title = canvas.title || tr('canvas.smartCanvas');
         document.getElementById('smartTitle').textContent = canvas.title || tr('canvas.smartCanvas');
         nodes = (Array.isArray(canvas.nodes) ? canvas.nodes : []).map(normalizeLegacySmartNode).filter(Boolean);
+        migrateSmartGroupImageMembers();
         nodes.forEach(n => {
             const pendingTasks = smartPendingTasks(n);
             if(pendingTasks.length){
@@ -5173,17 +5371,45 @@ function shellPoint(event){
 function renderConnections(){
     const conns = (canvas?.connections || []).map((conn, index) => ({...conn, index})).filter(c => nodes.some(n => n.id === c.from) && nodes.some(n => n.id === c.to));
     const cascadeKeys = cascadeConnectionKeys();
-    const paths = conns.map(conn => {
-        const fromNode = nodes.find(n => n.id === conn.from);
-        const toNode = nodes.find(n => n.id === conn.to);
-        const fr = nodeRect(fromNode), tr = nodeRect(toNode);
+    // 合并连线：同一来源连到同一分组的多个成员，合成一条到分组的连线（A→A1/A2/A3 显示为 A→分组），
+    // 减少“每张图都拖一条线”的杂乱。history 连线不合并。
+    const buckets = new Map();
+    const items = [];
+    conns.forEach(conn => {
         const kind = conn.kind || 'flow';
+        const fromScope = kind === 'history' ? '' : smartGroupScopeId(conn.from);
+        const toScope = kind === 'history' ? '' : smartGroupScopeId(conn.to);
+        // 同一分组内部的连线（成员↔成员、成员↔分组本体）属于内部关系，入组后隐藏，保持整洁。
+        if(fromScope && fromScope === toScope) return;
+        // 终点是某分组的成员：把同一来源连到该分组各成员的线合并成一条到分组的线。
+        const isMemberTarget = toScope && toScope !== conn.to;
+        if(isMemberTarget){
+            const key = `${conn.from}|${toScope}|${kind}`;
+            let b = buckets.get(key);
+            if(!b){ b = {merged:true, from:conn.from, toId:toScope, kind, indices:[], targets:[]}; buckets.set(key, b); items.push(b); }
+            b.indices.push(conn.index);
+            b.targets.push(conn.to);
+        } else {
+            items.push({merged:false, from:conn.from, toId:conn.to, kind, indices:[conn.index], targets:[conn.to]});
+        }
+    });
+    const paths = items.map(item => {
+        const fromNode = nodes.find(n => n.id === item.from);
+        const toNode = nodes.find(n => n.id === item.toId);
+        if(!fromNode || !toNode) return '';
+        const fr = nodeRect(fromNode), tr = nodeRect(toNode);
+        const kind = item.kind;
         const isHistory = kind === 'history';
-        const isInsertPreview = loopInsertPreview?.index === conn.index;
-        const edgeKey = `${conn.from}->${conn.to}`;
-        const cascadeState = smartCascadeEdgeState(edgeKey);
-        const isCascade = !isHistory && (cascadeKeys.has(edgeKey) || Boolean(cascadeState) || isInsertPreview);
-        const isPendingLine = Boolean(toNode.pending && !isCascade);
+        const dataIndex = item.indices.join(',');
+        const isInsertPreview = item.indices.some(i => loopInsertPreview?.index === i);
+        const edgeKeys = item.targets.map(t => `${item.from}->${t}`);
+        const states = edgeKeys.map(smartCascadeEdgeState).filter(Boolean);
+        let cascadeState = '';
+        if(states.includes('active')) cascadeState = 'active';
+        else if(states.some(s => s !== 'done')) cascadeState = states.find(s => s !== 'done');
+        else if(states.length) cascadeState = 'done';
+        const isCascade = !isHistory && (edgeKeys.some(k => cascadeKeys.has(k)) || Boolean(cascadeState) || isInsertPreview);
+        const isPendingLine = !isCascade && item.targets.some(t => nodes.find(n => n.id === t)?.pending);
         const fx = isHistory ? fr.x + fr.width / 2 : fr.x + fr.width;
         const fy = isHistory ? fr.y + fr.height : fr.y + fr.height / 2;
         const tx = isHistory ? tr.x + tr.width / 2 : tr.x;
@@ -5205,7 +5431,7 @@ function renderConnections(){
         const color = isCascade ? '#16a34a' : isHistory ? 'rgba(100,116,139,0.46)' : kind === 'input' ? 'rgba(100,116,139,0.62)' : 'rgba(148,163,184,0.62)';
         const opacity = isPendingLine ? '.82' : '1';
         const width = kind === 'input' ? '1.9' : '1.6';
-        return `<path class="${cls}" d="${curve}" stroke="${color}" stroke-width="${width}" fill="none" opacity="${opacity}"></path><path class="conn-hit" data-conn-index="${conn.index}" d="${curve}" stroke="transparent" stroke-width="14" fill="none"></path><circle cx="${tx}" cy="${ty}" r="3.5" fill="${color}" opacity=".66"></circle><g class="conn-cut" data-conn-index="${conn.index}" transform="translate(${mx} ${my})"><circle r="8" fill="var(--card)" stroke="${color}" stroke-width="1.4"></circle><path d="M-3 -3 L3 3 M3 -3 L-3 3" stroke="${color}" stroke-width="1.5" stroke-linecap="round"></path></g>`;
+        return `<path class="${cls}" d="${curve}" stroke="${color}" stroke-width="${width}" fill="none" opacity="${opacity}"></path><path class="conn-hit" data-conn-index="${dataIndex}" d="${curve}" stroke="transparent" stroke-width="14" fill="none"></path><circle cx="${tx}" cy="${ty}" r="3.5" fill="${color}" opacity=".66"></circle><g class="conn-cut" data-conn-index="${dataIndex}" transform="translate(${mx} ${my})"><circle r="8" fill="var(--card)" stroke="${color}" stroke-width="1.4"></circle><path d="M-3 -3 L3 3 M3 -3 L-3 3" stroke="${color}" stroke-width="1.5" stroke-linecap="round"></path></g>`;
     }).join('');
     return `<svg class="connection-layer" width="6000" height="4000" viewBox="0 0 6000 4000" xmlns="http://www.w3.org/2000/svg">${paths}</svg>`;
 }
@@ -5274,11 +5500,12 @@ function updateNodeElementDuringResize(node){
             loadingGrid.style.gridTemplateColumns = `repeat(${cols}, 1fr)`;
             loadingGrid.style.gridTemplateRows = `repeat(${rows}, 1fr)`;
         }
+        const maxVisibleRows = isSmartGroupNode(node) ? SMART_GROUP_MAX_VISIBLE_ROWS : MEDIA_GROUP_MAX_VISIBLE_ROWS;
         const grid = body.querySelector('.thumb-grid');
         if(grid){
             grid.style.setProperty('--thumb-cols', layout.cols);
             grid.style.setProperty('--thumb-size', `${layout.thumb}px`);
-            const visibleRows = Math.max(1, Math.min(MEDIA_GROUP_MAX_VISIBLE_ROWS, Number(layout.visibleRows || layout.rows || 1)));
+            const visibleRows = Math.max(1, Math.min(maxVisibleRows, Number(layout.visibleRows || layout.rows || 1)));
             const maxHeight = visibleRows * Number(layout.thumb || 96) + Math.max(0, visibleRows - 1) * 8;
             grid.style.setProperty('--thumb-max-height', `${maxHeight}px`);
             grid.querySelectorAll('.thumb-item').forEach((itemEl, index) => {
@@ -5287,8 +5514,11 @@ function updateNodeElementDuringResize(node){
         }
         const wrap = body.querySelector('.image-wrap');
         if(wrap){
-            wrap.style.setProperty('--node-img-w', `${layout.width}px`);
-            wrap.style.setProperty('--node-img-h', `${layout.height}px`);
+            // 分组单图卡片含 16px 内边距（PAD=32），图片按内边距内的尺寸显示，避免溢出边框。
+            const wrapW = isSmartGroupNode(node) ? Math.max(24, Number(layout.width) - 32) : layout.width;
+            const wrapH = isSmartGroupNode(node) ? Math.max(24, Number(layout.height) - 32) : layout.height;
+            wrap.style.setProperty('--node-img-w', `${wrapW}px`);
+            wrap.style.setProperty('--node-img-h', `${wrapH}px`);
         }
         const media = body.querySelector('.node-img');
         if(media){
@@ -5681,6 +5911,11 @@ function downloadPreviewFile(item){
     link.remove();
 }
 function previewDownloadGroupItems(){
+    // 分组预览：整组所有成员图片按阅读顺序打包。
+    if(previewNavState.groupId){
+        const group = nodes.find(n => n.id === previewNavState.groupId && isSmartGroupNode(n));
+        if(group) return smartGroupImageRefs(group).map((r, index) => ({...r.item, __index:index}));
+    }
     const node = nodes.find(n => n.id === previewNavState.nodeId);
     return (node?.images || [])
         .filter(item => item?.url)
@@ -5694,19 +5929,19 @@ function previewDownloadGroupItems(){
             return colDiff || a.__index - b.__index;
         });
 }
-async function downloadPreviewGroup(){
-    const node = nodes.find(n => n.id === previewNavState.nodeId);
-    const items = previewDownloadGroupItems();
-    if(!items.length) return;
+// 把一组图片打包成 zip 下载（预览“下载全部”和分组小菜单“批量下载”共用）。
+async function zipDownloadImageItems(title, items){
+    const list = (items || []).filter(item => item?.url);
+    if(!list.length) return;
     try {
-        const filename = safeExportFileName(`${node?.title || 'image-group'}.zip`, 'image-group.zip');
+        const filename = safeExportFileName(`${title || 'image-group'}.zip`, 'image-group.zip');
         const response = await fetch('/api/canvas-assets/download', {
             method:'POST',
             headers:{'Content-Type':'application/json'},
             body:JSON.stringify({
                 filename,
-                urls:items.map(item => item.url).filter(Boolean),
-                items:items.map((item, index) => ({url:item.url, name:downloadNameForMediaItem(item, `image-${String(index + 1).padStart(2, '0')}`)}))
+                urls:list.map(item => item.url).filter(Boolean),
+                items:list.map((item, index) => ({url:item.url, name:downloadNameForMediaItem(item, `image-${String(index + 1).padStart(2, '0')}`)}))
             })
         });
         if(!response.ok) throw new Error((await response.text()) || '批量下载失败');
@@ -5722,6 +5957,15 @@ async function downloadPreviewGroup(){
     } catch(e) {
         toast((e.message || '批量下载失败').slice(0, 160));
     }
+}
+async function downloadPreviewGroup(){
+    const group = previewNavState.groupId ? nodes.find(n => n.id === previewNavState.groupId) : null;
+    const owner = group || nodes.find(n => n.id === previewNavState.nodeId);
+    return zipDownloadImageItems(owner?.title, previewDownloadGroupItems());
+}
+function downloadSmartGroupImages(group){
+    if(!isSmartGroupNode(group)) return;
+    return zipDownloadImageItems(group?.title, smartGroupImageRefs(group).map(r => r.item));
 }
 function smartRunPlatformLabel(run){
     const s = run?.settings || {};
@@ -6078,6 +6322,21 @@ function smartLoopBodyHtml(node){
     </div>`;
 }
 function smartGroupBodyHtml(node){
+    // 组内图片收进卡片，渲染成可滚动缩略图网格（跟多图节点一致，超过 4 排出现滚动）。
+    const imgs = (node.images || []).map(imageForDisplay).filter(img => img?.url);
+    if(imgs.length){
+        const layout = imageLayout(node.images || [], nodeScale(node), node);
+        if(imgs.length === 1){
+            const img = imgs[0];
+            // 外框含 16px 内边距（PAD=32）；图片按内边距内的可用空间显示，避免溢出到边框外。
+            const innerW = Math.max(24, Number(layout.width) - 32);
+            const innerH = Math.max(24, Number(layout.height) - 32);
+            return `<div class="image-wrap ${selectedImage.nodeId === node.id && selectedImage.index === 0 ? 'image-selected' : ''}" data-image-index="0" data-media-signature="${escapeAttr(`${mediaKindForItem(img)}:${img?.url || ''}`)}" style="--node-img-w:${innerW}px;--node-img-h:${innerH}px">${singleMediaHtml(img, innerW, innerH)}${imageResolutionBadgeHtml(img)}<button class="mini-x image-delete" type="button" data-image-index="0" title="${escapeHtml(tr('smart.deleteImage'))}"><i data-lucide="trash-2"></i></button></div>`;
+        }
+        const visibleRows = Math.max(1, Math.min(SMART_GROUP_MAX_VISIBLE_ROWS, Number(layout.visibleRows || layout.rows || 1)));
+        const maxHeight = visibleRows * Number(layout.thumb || 96) + Math.max(0, visibleRows - 1) * 8;
+        return `<div class="thumb-grid" data-thumb-scroll="1" style="--thumb-cols:${layout.cols}; --thumb-size:${layout.thumb}px; --thumb-max-height:${maxHeight}px">${imgs.map((img, i) => `<div class="thumb-item ${selectedImage.nodeId === node.id && selectedImage.index === i ? 'image-selected' : ''}" data-image-index="${i}" data-media-signature="${escapeAttr(`${mediaKindForItem(img)}:${img?.url || ''}`)}">${thumbMediaHtml(img)}${imageResolutionBadgeHtml(img)}<button class="mini-x image-delete" type="button" data-image-index="${i}" title="${escapeHtml(tr('smart.deleteImage'))}"><i data-lucide="trash-2"></i></button></div>`).join('')}</div>`;
+    }
     const members = smartGroupMembers(node);
     const counts = members.reduce((acc, member) => {
         if(member.type === 'smart-prompt') acc.prompt += 1;
@@ -6089,10 +6348,10 @@ function smartGroupBodyHtml(node){
         counts.prompt ? `${counts.prompt} 提示词` : '',
         counts.media ? `${counts.media} 素材` : '',
         counts.loop ? `${counts.loop} 循环` : ''
-    ].filter(Boolean).join(' · ') || '双击添加节点';
+    ].filter(Boolean).join(' · ') || '双击或拖入图片';
     return `<div class="smart-group-card">
         <div class="smart-group-summary"><i data-lucide="group"></i><span>${escapeHtml(summary)}</span></div>
-        ${members.length ? '' : `<div class="smart-group-empty"><i data-lucide="plus"></i><span>拖入提示词 / 图片 / 循环，或双击添加</span></div>`}
+        ${members.length ? '' : `<div class="smart-group-empty"><i data-lucide="plus"></i><span>拖入图片自动收进分组</span></div>`}
     </div>`;
 }
 function nodeBodyHtml(node, layout){
@@ -6239,6 +6498,56 @@ function runSmartNodeToolbarAction(nodeId, action){
         setGridOperationMode('join');
     }
 }
+// 智能分组顶部小菜单：整理排列 / 预览（整组左右切换）/ 宫格拼接 / 批量下载 / 解散分组。
+// 与多图节点的 smart-node-floating-menu 同款样式与定位（选中分组时浮在卡片上方）。
+function smartGroupToolbarHtml(node){
+    if(!isSmartGroupNode(node)) return '';
+    const hasContent = (node.images || []).some(img => img?.url) || smartGroupMembers(node).length > 0;
+    const imageCount = (node.images || []).filter(img => img?.url).length;
+    const actions = [
+        {key:'arrange', icon:'layout-grid', label:'整理排列', enabled:hasContent},
+        {key:'preview', icon:'eye', label:'预览', enabled:imageCount > 0},
+        {key:'grid', icon:'grid-3x3', label:'宫格拼接', enabled:imageCount > 1},
+        {key:'download', icon:'archive', label:'批量下载', enabled:imageCount > 0},
+        {key:'ungroup', icon:'ungroup', label:'解散分组', enabled:true}
+    ];
+    return `<div class="smart-node-floating-menu" data-smart-group-menu="1">${actions.map(action => `
+        <button type="button" data-smart-group-action="${escapeAttr(action.key)}" data-node-id="${escapeAttr(node.id)}" ${action.enabled ? '' : 'disabled'} title="${escapeAttr(action.label)}">
+            <i data-lucide="${escapeAttr(action.icon)}"></i><span>${escapeHtml(action.label)}</span>
+        </button>`).join('')}</div>`;
+}
+function runSmartGroupToolbarAction(nodeId, action){
+    const group = nodes.find(n => n.id === nodeId);
+    if(!isSmartGroupNode(group)) return;
+    selectedId = nodeId;
+    selectedIds = [];
+    selectedImage = {nodeId:'', index:-1};
+    if(action === 'arrange'){
+        if(arrangeSmartGroupMembers(group)){ render(); scheduleSave(); toast('已整理分组'); }
+        else toast('分组内没有可整理的节点');
+        return;
+    }
+    if(action === 'ungroup'){ ungroupNode(nodeId); return; }
+    // 图片已收进分组（group.images），预览/下载/拼接直接复用单节点机器（分组就是一个多图容器）。
+    const imageCount = (group.images || []).filter(img => img?.url).length;
+    if(!imageCount){ toast('分组内没有图片'); return; }
+    if(action === 'preview'){
+        const first = (group.images || []).findIndex(img => img?.url);
+        openImagePreview(nodeId, Math.max(0, first));
+        return;
+    }
+    if(action === 'download'){ zipDownloadImageItems(group.title, (group.images || []).map(imageForDisplay)); return; }
+    if(action === 'grid'){
+        if(imageCount <= 1){ toast('分组至少需要 2 张图片才能宫格拼接'); return; }
+        const first = (group.images || []).findIndex(img => img?.url);
+        openImageEditor(nodeId, Math.max(0, first));
+        if(imageEditModal.classList.contains('open')){
+            setImageEditMode('grid', true);
+            setGridOperationMode('join');
+        }
+        return;
+    }
+}
 function nowMs(){ return Date.now(); }
 function formatRunDuration(ms){
     const total = Math.max(0, Math.floor(Number(ms || 0) / 1000));
@@ -6327,7 +6636,7 @@ function render(){
         const html = `<div class="image-node ${isEmpty ? 'empty-node' : ''} ${isGroup ? 'group-node' : ''} ${isHistory ? 'history-group-node' : ''} ${isPrompt ? 'prompt-smart-node' : ''} ${isLoop ? 'loop-smart-node' : ''} ${isSmartGroup ? 'smart-group-node' : ''} ${isNodeSelected(node.id) ? 'selected' : ''} ${(dragState?.groupIds?.includes(node.id) || dragState?.id === node.id) ? 'dragging' : ''} ${node.running ? 'node-running' : ''} ${isPending ? 'node-pending' : ''}" data-id="${escapeHtml(node.id)}" style="left:${node.x || 0}px;top:${node.y || 0}px;width:${layout.width}px;height:${layout.height}px">
             <div class="node-head"><div class="node-title">${title}</div><div class="node-actions">${deleteBtn}</div></div>
             ${!isEmpty && !isGroup ? `<div class="floating-node-actions"><button class="mini-x node-delete" type="button" title="${escapeHtml(tr('smart.deleteNode'))}"><i data-lucide="trash-2"></i></button></div>` : ''}
-            ${smartNodeToolbarHtml(node)}
+            ${smartNodeToolbarHtml(node)}${smartGroupToolbarHtml(node)}
             ${runTimePillHtml(node)}
             <div class="node-body">${body}</div>
             <div class="node-hint">${hint}</div>
@@ -6481,14 +6790,13 @@ function bindConnectionEvents(){
         if(el.classList.contains('conn-hit')){
             el.addEventListener('dblclick', e => {
                 e.preventDefault(); e.stopPropagation();
-                disconnectConnection(Number(el.dataset.connIndex));
+                disconnectConnections(el.dataset.connIndex);
             });
             return;
         }
         el.addEventListener('click', e => {
             e.preventDefault(); e.stopPropagation();
-            const index = Number(el.dataset.connIndex);
-            disconnectConnection(index);
+            disconnectConnections(el.dataset.connIndex);
         });
     });
 }
@@ -6992,6 +7300,14 @@ function bindNodeEvents(){
                 runSmartNodeToolbarAction(btn.dataset.nodeId || id, btn.dataset.smartNodeAction);
             });
         });
+        el.querySelectorAll('[data-smart-group-action]').forEach(btn => {
+            btn.addEventListener('mousedown', e => { e.preventDefault(); e.stopPropagation(); }, true);
+            btn.addEventListener('click', e => {
+                e.preventDefault();
+                e.stopPropagation();
+                runSmartGroupToolbarAction(btn.dataset.nodeId || id, btn.dataset.smartGroupAction);
+            });
+        });
         el.querySelectorAll('[data-jimeng-query]').forEach(btn => {
             btn.addEventListener('mousedown', e => { e.preventDefault(); e.stopPropagation(); }, true);
             btn.addEventListener('click', e => {
@@ -7060,7 +7376,7 @@ function bindNodeEvents(){
                 selectedId = id;
                 selectedIds = [];
                 selectedImage = {nodeId:id, index:imageIndex};
-                openImagePreview(id, imageIndex);
+                openImagePreviewSmart(id, imageIndex);
             }, true);
             item.addEventListener('click', e => {
                 if(e.target.closest('video,audio')) return;
@@ -7084,7 +7400,7 @@ function bindNodeEvents(){
                     selectedId = id;
                     selectedIds = [];
                     selectedImage = {nodeId:id, index:imageIndex};
-                    openImagePreview(id, imageIndex);
+                    openImagePreviewSmart(id, imageIndex);
                     return;
                 }
                 clearImageClickTimer();
@@ -7118,7 +7434,7 @@ function bindNodeEvents(){
             selectedId = id;
             selectedIds = [];
             selectedImage = {nodeId:id, index:imageIndex};
-            openImagePreview(id, imageIndex);
+            openImagePreviewSmart(id, imageIndex);
         }, true);
         });
         el.querySelectorAll('.thumb-item').forEach(item => {
@@ -7321,20 +7637,31 @@ function deleteNodeFromButton(id){
     deleteNode(id);
 }
 function disconnectConnection(index){
+    disconnectConnections([index]);
+}
+// 断开一条或多条连线（合并到分组的连线会一次性断开其下所有成员连线）。spec 可为索引数组或逗号分隔字符串。
+function disconnectConnections(spec){
     if(!canvas || !Array.isArray(canvas.connections)) return;
-    const conn = canvas.connections[index];
-    if(!conn) return;
+    const indices = (Array.isArray(spec) ? spec : String(spec).split(','))
+        .map(v => Number(v))
+        .filter(n => Number.isInteger(n) && n >= 0 && n < canvas.connections.length);
+    if(!indices.length) return;
+    const set = new Set(indices);
+    const removed = canvas.connections.filter((_, i) => set.has(i));
+    if(!removed.length) return;
     pushUndo();
-    canvas.connections.splice(index, 1);
-    const toNode = nodes.find(n => n.id === conn.to);
-    if(toNode && Array.isArray(toNode.inputNodeIds)){
-        toNode.inputNodeIds = toNode.inputNodeIds.filter(id => id !== conn.from);
-    }
-    if(toNode && ['input','flow'].includes(conn.kind || 'flow')) clearDetachedRunInputRefs(toNode);
-    if((conn.kind || 'flow') === 'history'){
-        const group = nodes.find(n => n.id === conn.to && isHistoryGroupNode(n) && n.historyFor === conn.from);
-        demoteHistoryGroupNode(group);
-    }
+    canvas.connections = canvas.connections.filter((_, i) => !set.has(i));
+    removed.forEach(conn => {
+        const toNode = nodes.find(n => n.id === conn.to);
+        if(toNode && Array.isArray(toNode.inputNodeIds)){
+            toNode.inputNodeIds = toNode.inputNodeIds.filter(id => id !== conn.from);
+        }
+        if(toNode && ['input','flow'].includes(conn.kind || 'flow')) clearDetachedRunInputRefs(toNode);
+        if((conn.kind || 'flow') === 'history'){
+            const group = nodes.find(n => n.id === conn.to && isHistoryGroupNode(n) && n.historyFor === conn.from);
+            demoteHistoryGroupNode(group);
+        }
+    });
     render();
     scheduleSave();
 }
@@ -8814,10 +9141,32 @@ function gridSplitSettings(){
     return {rows:hLines + 1, cols:vLines + 1, gap:syncGridGapValue()};
 }
 function currentGridJoinItems(){
+    // 分组拼接：聚合组内所有图片成员的图片，按阅读顺序给出连续索引（source 指向真实图片对象以写回自然尺寸）。
+    if(gridJoinGroupId){
+        const group = nodes.find(n => n.id === gridJoinGroupId && isSmartGroupNode(n));
+        if(group){
+            return smartGroupImageRefs(group)
+                .filter(r => mediaKindForItem(r.item) === 'image' && r.item?.url)
+                .map((r, index) => ({item:r.item, source:r.source, index}));
+        }
+    }
     const node = currentEditImage().node;
     return (node?.images || [])
         .map((item, index) => ({item:imageForDisplay(item), source:item, index}))
         .filter(entry => mediaKindForItem(entry.item) === 'image' && entry.item?.url);
+}
+// 从分组小菜单打开“宫格拼接”：锚定在分组第一张图片（保证编辑器有真实底图，不出现破图/尺寸异常），
+// 但把拼接数据源切换到整个分组（gridJoinGroupId）。
+function openGroupGridJoin(group){
+    if(!isSmartGroupNode(group)) return;
+    const refs = smartGroupImageRefs(group).filter(r => mediaKindForItem(r.item) === 'image');
+    if(refs.length <= 1){ toast('分组至少需要 2 张图片才能宫格拼接'); return; }
+    const first = refs[0];
+    openImageEditor(first.nodeId, first.index);
+    if(!imageEditModal.classList.contains('open')) return;
+    gridJoinGroupId = group.id;
+    setImageEditMode('grid', true);
+    setGridOperationMode('join');
 }
 function canGridJoinCurrentNode(){
     return currentGridJoinItems().length > 1;
@@ -9312,8 +9661,13 @@ function resetCropBox(){
     renderCropBox();
 }
 function updatePreviewNavButtons(){
-    const node = nodes.find(n => n.id === previewNavState.nodeId);
-    const count = Math.max(0, (node?.images || []).filter(img => img?.url).length);
+    let count;
+    if(previewNavState.groupId && Array.isArray(previewNavState.seq)){
+        count = previewNavState.seq.length;
+    } else {
+        const node = nodes.find(n => n.id === previewNavState.nodeId);
+        count = Math.max(0, (node?.images || []).filter(img => img?.url).length);
+    }
     previewNavState.count = count;
     const show = imageEditModal.classList.contains('open') && imageEditMode === 'preview' && count > 1;
     document.getElementById('previewPrevBtn')?.classList.toggle('visible', show);
@@ -9321,6 +9675,22 @@ function updatePreviewNavButtons(){
 }
 function navigatePreviewImage(delta){
     if(!imageEditModal.classList.contains('open') || imageEditMode !== 'preview') return;
+    // 分组预览：跨成员节点按整组序列左右切换（openImageEditor 会重置 previewNavState，故切换后重新挂回分组上下文）。
+    if(previewNavState.groupId && Array.isArray(previewNavState.seq) && previewNavState.seq.length > 1){
+        const groupId = previewNavState.groupId;
+        const seq = previewNavState.seq;
+        const pos = (Number(previewNavState.seqPos || 0) + Number(delta || 0) + seq.length) % seq.length;
+        const ref = seq[pos];
+        openImageEditor(ref.nodeId, ref.index);
+        if(imageEditModal.classList.contains('open')){
+            previewNavState.groupId = groupId;
+            previewNavState.seq = seq;
+            previewNavState.seqPos = pos;
+            // openImageEditor 重置了 previewNavState，需在恢复分组上下文后重算导航/下载全部按钮。
+            setImageEditMode('preview');
+        }
+        return;
+    }
     const node = nodes.find(n => n.id === previewNavState.nodeId);
     const images = (node?.images || []).filter(img => img?.url);
     if(!node || images.length <= 1) return;
@@ -9330,6 +9700,31 @@ function navigatePreviewImage(delta){
 }
 function openImagePreview(nodeId, imageIndex=0){
     openImageEditor(nodeId, imageIndex);
+    setImageEditMode('preview');
+}
+// 双击组内图片时按整组预览；非分组成员退回单节点预览。
+function openImagePreviewSmart(nodeId, imageIndex=0){
+    const group = smartGroupContainingNode(nodeId);
+    if(group){
+        openGroupImagePreview(group, nodeId, imageIndex);
+        return;
+    }
+    openImagePreview(nodeId, imageIndex);
+}
+// 打开整组图片预览：以被双击图片为起点，左右切换遍历分组内所有图片。
+function openGroupImagePreview(group, startNodeId, startIndex=0){
+    if(!isSmartGroupNode(group)){ openImagePreview(startNodeId, startIndex); return; }
+    const refs = smartGroupImageRefs(group);
+    if(refs.length <= 1){ openImagePreview(startNodeId, startIndex); return; }
+    const seq = refs.map(r => ({nodeId:r.nodeId, index:r.index}));
+    let pos = seq.findIndex(s => s.nodeId === startNodeId && Number(s.index) === Number(startIndex));
+    if(pos < 0) pos = 0;
+    openImagePreview(seq[pos].nodeId, seq[pos].index);
+    if(!imageEditModal.classList.contains('open')) return;
+    previewNavState.groupId = group.id;
+    previewNavState.seq = seq;
+    previewNavState.seqPos = pos;
+    // 恢复分组上下文后重算导航/下载全部按钮（openImageEditor 已把 previewNavState 重置成单节点态）。
     setImageEditMode('preview');
 }
 function openImageEditor(nodeId, imageIndex=0){
@@ -9346,7 +9741,7 @@ function openImageEditor(nodeId, imageIndex=0){
     previewNavState = {nodeId, index:imageIndex, count:(node.images || []).filter(img => img?.url).length};
     cropState = {nodeId, imageIndex, x:0, y:0, w:0, h:0};
     gridCustomMode = false; gridCustomLines = []; gridCustomHistory = []; gridCustomDrag = null; gridCustomOrientation = 'h';
-    gridOperationMode = 'split'; gridJoinLayout = null; gridJoinDrag = null; gridJoinImageCache = new Map(); gridJoinUserMoved = false;
+    gridOperationMode = 'split'; gridJoinLayout = null; gridJoinDrag = null; gridJoinImageCache = new Map(); gridJoinUserMoved = false; gridJoinGroupId = '';
     imageEditZoom = 1.0; imageEditBaseW = 0; imageEditBaseH = 0; imageEditModeTouched = false;
     editTextItems = []; editTextSelectedId = ''; editTextDrag = null; editTextDirty = false;
     const toggle = document.getElementById('gridCustomToggle');
@@ -9428,7 +9823,7 @@ function closeImageEditor(){
         previewVideo.style.display = 'none';
     }
     clearEditDrawing(true);
-    cropState = null; cropDrag = null; editDrawState = null; resetEditDrawingHistory(); gridCustomDrag = null; gridJoinDrag = null; gridJoinLayout = null; gridJoinImageCache = new Map(); gridJoinUserMoved = false; gridOperationMode = 'split';
+    cropState = null; cropDrag = null; editDrawState = null; resetEditDrawingHistory(); gridCustomDrag = null; gridJoinDrag = null; gridJoinLayout = null; gridJoinImageCache = new Map(); gridJoinUserMoved = false; gridOperationMode = 'split'; gridJoinGroupId = '';
     previewNavState = {nodeId:'', index:0, count:0};
     imageEditZoom = 1.0; imageEditBaseW = 0; imageEditBaseH = 0; imageEditModeTouched = false;
     disposePanoramaPreview();
@@ -13680,10 +14075,14 @@ function groupSelectedNodes(){
         w:Math.max(340, Math.round(maxX - minX + 36)),
         h:Math.max(220, Math.round(maxY - minY + 72)),
         title:'智能分组',
-        items:selected.map(node => node.id),
+        items:[],
+        images:[],
         created_at:Date.now()
     };
     nodes.push(group);
+    // 图片成员吸收进分组网格，提示词/循环作为成员节点；随后自动整理。
+    selected.forEach(node => addNodeToSmartGroup(group, node));
+    arrangeSmartGroupMembers(group, {skipUndo:true});
     selectedIds = [];
     selectedId = group.id;
     selectedImage = {nodeId:'', index:-1};
@@ -13693,17 +14092,37 @@ function groupSelectedNodes(){
 function ungroupNode(groupId){
     const group = nodes.find(n => n.id === groupId);
     if(!group) return false;
-    // 释放智能分组：删除分组容器即可，成员本就是画布上的独立节点，原地保留（保持当前尺寸，不自动放大）。
+    // 释放智能分组：把收进卡片的图片重新拆成独立图片节点（平铺在分组原位置），提示词/循环成员原地保留，再删除分组容器。
     if(isSmartGroupNode(group)){
         pushUndo();
         const memberIds = smartGroupMembers(group).map(m => m.id);
+        const groupImages = (group.images || []).filter(img => img?.url);
+        let created = [];
+        if(groupImages.length){
+            const layout = imageLayout(group.images || [], nodeScale(group), group);
+            const pad = 16, gap = 8;
+            const cell = Math.max(28, Math.round(layout.thumb || 96));
+            const cols = Math.max(1, layout.cols || 1);
+            created = groupImages.map((img, index) => {
+                const col = index % cols;
+                const row = Math.floor(index / cols);
+                const size = thumbDisplaySize(img, cell);
+                const x = Math.round(Number(group.x || 0) + pad + col * (cell + gap) + Math.max(0, (cell - size.width) / 2));
+                const y = Math.round(Number(group.y || 0) + pad + row * (cell + gap) + Math.max(0, (cell - size.height) / 2));
+                const node = {id:uid('smart'), type:'smart-image', x, y, w:size.width, h:size.height, title:'Image', images:[stripImageGenerationMeta({...img})], scale:MEDIA_NODE_DEFAULT_SCALE, created_at:Date.now()};
+                inheritNodeMetaFromImage(node);
+                clearDetachedRunInputRefs(node);
+                return node;
+            });
+        }
         nodes = nodes.filter(n => n.id !== groupId);
+        nodes.push(...created);
         if(canvas) canvas.connections = (canvas.connections || []).filter(c => c.from !== groupId && c.to !== groupId);
         nodes.forEach(node => {
             if(Array.isArray(node.inputNodeIds)) node.inputNodeIds = node.inputNodeIds.filter(id => id !== groupId);
             if(isSmartGroupNode(node) && Array.isArray(node.items)) node.items = node.items.filter(id => id !== groupId);
         });
-        selectedIds = memberIds.filter(id => nodes.some(n => n.id === id));
+        selectedIds = [...created.map(n => n.id), ...memberIds].filter(id => nodes.some(n => n.id === id));
         selectedId = selectedIds.length === 1 ? selectedIds[0] : '';
         selectedImage = {nodeId:'', index:-1};
         render();
@@ -13796,13 +14215,24 @@ function smartGroupTargetForDraggedNode(draggedNode){
     return groups[0].group;
 }
 function addDraggedNodeToSmartGroup(draggedNode, group){
-    if(!draggedNode || !group) return false;
-    const wasGroup = isSmartGroupNode(draggedNode);
-    const added = addNodeToSmartGroup(group, draggedNode);
+    return addDraggedNodesToSmartGroup(draggedNode ? [draggedNode] : [], group);
+}
+// 把一个或多个被拖动的节点批量加入目标分组（支持多选拖入）。入组后只整理一次并选中目标分组。
+function addDraggedNodesToSmartGroup(draggedNodes, group){
+    if(!group || !isSmartGroupNode(group)) return false;
+    const list = (draggedNodes || []).filter(n => n && n.id !== group.id);
+    if(!list.length) return false;
+    let added = false;
+    list.forEach(n => {
+        if(addNodeToSmartGroup(group, n)) added = true;
+    });
     if(!added) return false;
+    // 提示词/循环成员入组后自动整理成网格（图片已收进卡片网格，自动平铺）。
+    arrangeSmartGroupMembers(group, {skipUndo:true});
     selectedIds = [];
-    // 拖入的是分组时它已被释放（删除），改选中目标主分组，避免选中已删除的节点。
-    selectedId = wasGroup ? group.id : draggedNode.id;
+    // 图片被吸收进分组（原节点已删除），统一选中目标分组；仅当单个提示词/循环节点拖入时保持选中它。
+    const survivingSingle = list.length === 1 && nodes.some(n => n.id === list[0].id) ? list[0].id : '';
+    selectedId = survivingSingle || group.id;
     selectedImage = {nodeId:'', index:-1};
     return true;
 }
@@ -13826,6 +14256,8 @@ function openCreateMenu(event, options={}){
 function addCreatedNodeToMenuGroup(node){
     const group = createMenuGroupId ? nodes.find(n => n.id === createMenuGroupId) : null;
     if(addNodeToSmartGroup(group, node)){
+        // 通过分组小菜单新建的节点入组后自动整理（节点创建已压过 undo，这里不再重复）。
+        arrangeSmartGroupMembers(group, {skipUndo:true});
         render();
         scheduleSave();
     }
@@ -14030,6 +14462,14 @@ window.onmousemove = e => {
         const dy = (e.clientY - resizeState.startY) / viewport.scale;
         const minW = node.type === 'smart-prompt' ? 260 : node.type === 'smart-loop' ? 252 : node.type === 'smart-group' ? SMART_GROUP_MIN_WIDTH : 48;
         const minH = node.type === 'smart-prompt' ? 170 : node.type === 'smart-loop' ? 132 : node.type === 'smart-group' ? SMART_GROUP_MIN_HEIGHT : 48;
+        if(node.type === 'smart-group' && (node.images || []).some(img => img?.url)){
+            // 图片分组：和普通节点一样直接改 w/h，缩略图网格按新尺寸实时重排。不要走下面的“成员缩放”那套，
+            // 否则拖动过程里会按成员包围盒/缩放比例收缩，松手才回到拖动宽度（用户反馈的“变宽时先缩小”）。
+            node.w = Math.max(minW, Math.round(resizeState.startW + dx));
+            node.h = Math.max(minH, Math.round(resizeState.startH + dy));
+            updateNodeElementDuringResize(node);
+            return;
+        }
         if(node.type === 'smart-group'){
             // 分组当“画布中的画布”：拖手柄按宽度方向算出统一缩放比例，组内所有成员（图片+提示词）按相对手势
             // 起点的快照整体缩放+重排，然后把分组框自动收紧到成员的包围盒——盒子始终贴合内容，右侧不会留空白。
@@ -14283,8 +14723,10 @@ window.onmouseup = e => {
         const groupTarget = draggedNode && (draggedNode.images || []).length && (dragState.group || []).length <= 1 && draggedRect
             ? rectOverlapNode(draggedNode.id, draggedRect.x, draggedRect.y, draggedRect.width, draggedRect.height, dragState.groupIds)
             : null;
-        // 拖分组时 dragState.group 里是分组本体+其成员（一起移动），属于“单个逻辑拖拽”，也允许触发并入目标分组。
-        const smartGroupTarget = draggedNode && (isSmartGroupNode(draggedNode) || (dragState.group || []).length <= 1) ? smartGroupTargetForDraggedNode(draggedNode) : null;
+        // 拖入分组：单个节点、多选（批量拖入）或整个分组（其成员会并入目标分组）都允许并入主分组下的目标分组。
+        // 目标分组由主拖动节点的中心命中决定；smartGroupTargetForDraggedNode 已排除正在被拖动的节点/分组。
+        const draggedNodes = (dragState.group || []).map(item => nodes.find(n => n.id === item.id)).filter(Boolean);
+        const smartGroupTarget = draggedNode ? smartGroupTargetForDraggedNode(draggedNode) : null;
         if(
             insertHit &&
             insertLoopNodeIntoConnection(draggedNode, insertHit)
@@ -14293,7 +14735,7 @@ window.onmouseup = e => {
             render();
         } else if(
             smartGroupTarget &&
-            addDraggedNodeToSmartGroup(draggedNode, smartGroupTarget)
+            addDraggedNodesToSmartGroup(draggedNodes.length ? draggedNodes : [draggedNode], smartGroupTarget)
         ){
             stateChanged = true;
             render();

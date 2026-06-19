@@ -294,7 +294,12 @@ let pendingPurgeCanvasId = null;
 let emojiPickerCanvasId = null;
 let canvasMetaAnchorId = '';
 let canvasSortMode = (() => { try { return localStorage.getItem('canvasSortMode') || 'recent'; } catch(e){ return 'recent'; } })();
+const CANVAS_LIST_PROJECT_KEY = 'canvasListCurrentProjectId';
 const CANVAS_COLOR_OPTIONS = ['red','orange','amber','green','teal','blue','violet','pink','slate'];
+// 先绑定返回，避免编辑器后续初始化较慢时丢失来源项目。
+backToManagerBtn?.addEventListener('click', () => {
+    window.location.href = canvasListUrlForProject(canvas?.project || requestedCanvasListProject() || rememberedCanvasListProject());
+});
 let localCanvasDirty = false;
 let savingCanvasNow = false;
 let saveCanvasAgain = false;
@@ -936,6 +941,7 @@ function setStatus(text){
     if(gateStatus) gateStatus.textContent = text;
 }
 function refreshGateViewControls(){
+    if(!canvasGate) return;
     canvasGate.classList.toggle('trash-mode', trashMode);
     if(gateTitleText) gateTitleText.textContent = trashMode ? tr('canvas.trash') : tr('canvas.selectCanvas');
     if(gateSubtitle) gateSubtitle.textContent = trashMode ? tr('canvas.trashSubtitle') : tr('canvas.subtitle');
@@ -1421,6 +1427,8 @@ async function setTrashMode(active){
     refreshIcons();
 }
 function renderCanvasList(){
+    // 选画布 gate 已拆分到独立页面 canvas-list.html；编辑器页不再有该 DOM，调用直接跳过。
+    if(!gateCanvasList) return;
     renderCanvasListInto(gateCanvasList);
 }
 function compareCanvasRecords(a, b){
@@ -1863,6 +1871,7 @@ async function openCanvas(id){
         const data = await res.json();
         resetCascadeRuntimeState();
         canvas = data.canvas;
+        rememberCanvasListProject(canvas.project || 'default');
         const touched = await touchCanvasOpened(canvas.id);
         if(touched?.updated_at) canvas.updated_at = Number(touched.updated_at);
         if((canvas.kind || 'classic') === 'smart'){
@@ -1890,6 +1899,8 @@ async function openCanvas(id){
     } catch(e) {
         setStatus(tr('canvas.openFailed'));
         console.error(e);
+        // 打开失败（id 无效/已删除）：回到选画布页面，避免停在空白编辑器。
+        window.location.replace(canvasListUrlForProject(canvas?.project || requestedCanvasListProject() || rememberedCanvasListProject()));
     }
 }
 function applyRemoteCanvasData(remote){
@@ -2136,18 +2147,19 @@ window.loadCanvasList = loadCanvasList;
 window.openCanvas = openCanvas;
 window.deleteCanvas = deleteCanvas;
 window.returnToCanvasManager = returnToCanvasManager;
-gateCreateBtn.addEventListener('click', () => setCreateMode(true));
+// 选画布 gate 已拆分到 canvas-list.html；编辑器页不再含这些元素，用可选链避免空引用报错。
+gateCreateBtn?.addEventListener('click', () => setCreateMode(true));
 gateCreateSmartBtn?.addEventListener('click', createSmartCanvas);
-gateBackBtn.addEventListener('click', () => setTrashMode(false));
-gateTrashBtn.addEventListener('click', () => setTrashMode(true));
-gateRefreshBtn.addEventListener('click', () => trashMode ? loadTrashList() : loadCanvasList(false));
+gateBackBtn?.addEventListener('click', () => setTrashMode(false));
+gateTrashBtn?.addEventListener('click', () => setTrashMode(true));
+gateRefreshBtn?.addEventListener('click', () => trashMode ? loadTrashList() : loadCanvasList(false));
 document.getElementById('gateSortSwitch')?.addEventListener('click', e => {
     const btn = e.target.closest('[data-sort]');
     if(btn) setCanvasSortMode(btn.dataset.sort);
 });
-gateConfirmBtn.addEventListener('click', createCanvas);
-gateCancelBtn.addEventListener('click', () => setCreateMode(false));
-gateTitleInput.addEventListener('keydown', e => {
+gateConfirmBtn?.addEventListener('click', createCanvas);
+gateCancelBtn?.addEventListener('click', () => setCreateMode(false));
+gateTitleInput?.addEventListener('keydown', e => {
     if(e.key === 'Enter') createCanvas();
     if(e.key === 'Escape') setCreateMode(false);
 });
@@ -2236,7 +2248,24 @@ document.getElementById('imageEditStage').addEventListener('wheel', event => {
 window.addEventListener('resize', () => {
     if(cropState) syncImageEditOverflow();
 });
-backToManagerBtn.addEventListener('click', returnToCanvasManager);
+function rememberCanvasListProject(projectId){
+    const pid = projectId || 'default';
+    try { localStorage.setItem(CANVAS_LIST_PROJECT_KEY, pid); } catch(e){}
+    return pid;
+}
+
+function rememberedCanvasListProject(){
+    try { return localStorage.getItem(CANVAS_LIST_PROJECT_KEY) || 'default'; } catch(e){ return 'default'; }
+}
+
+function requestedCanvasListProject(){
+    try { return new URLSearchParams(window.location.search).get('project') || ''; } catch(e){ return ''; }
+}
+
+function canvasListUrlForProject(projectId){
+    const pid = rememberCanvasListProject(projectId);
+    return `/static/canvas-list.html?project=${encodeURIComponent(pid)}`;
+}
 
 function addNode(node){
     if(!ensureCanvas()) return;
@@ -13943,6 +13972,11 @@ window.onload = async () => {
     applyViewport();
     await loadConfig();
     pruneMissingComfyWorkflows();
-    await loadCanvasList(false);
-    setCanvasMode(false);
+    // 编辑器页只负责打开单个画布：必须带 ?id；没有 id 就回到独立的选画布页面。
+    const openId = new URLSearchParams(window.location.search).get('id');
+    if(openId){
+        await openCanvas(openId);
+    } else {
+        window.location.replace(canvasListUrlForProject(rememberedCanvasListProject()));
+    }
 };
