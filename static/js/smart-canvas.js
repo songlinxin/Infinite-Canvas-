@@ -1442,7 +1442,6 @@ function smartNodeInputThumbsHeight(images){
     return rows ? rows * 44 + (rows - 1) * 6 + 8 : 0;
 }
 function promptNodeInputImages(node){
-    if(!node?.llmEnabled) return [];
     return promptNodeInputMediaForLLM(node).filter(img => img?.url);
 }
 function promptNodeInputMediaForLLM(node){
@@ -6248,7 +6247,7 @@ function promptNodeBodyHtml(node){
         </div>
         <div class="prompt-node-segments" style="height:${promptSplitPreviewH}px">${promptItems.length ? promptItems.map((item, index) => `<div class="prompt-node-segment"><span>${index + 1}</span><p>${escapeHtml(item)}</p></div>`).join('') : ''}</div>
         <div class="prompt-split-preview-resize prompt-node-control" data-prompt-split-resize="1" title="拖动调整高度"><span></span></div>` : ''}
-        ${node.llmEnabled ? inputThumbs : ''}
+        ${inputThumbs}
         ${llmParams}
     </div>`;
 }
@@ -11374,10 +11373,11 @@ function toggleInputRefBlocked(node, img){
 function defaultReferenceImagesFor(node, consume=false, ctx=smartLoopContext){
     if(!node) return [];
     const self = selfReferenceImagesForNode(node, consume, ctx).filter(img => img?.url);
-    const upstream = defaultInputImagesFor(node, consume, ctx);
+    const upstream = (smartImageUsesWorkflowInput(node, ctx) ? workflowInputImagesFor(node, consume, ctx) : inputImagesFor(node, consume, ctx))
+        .filter(img => img?.url);
     const manual = manualReferenceImagesFor(node);
     if(smartImageUsesWorkflowInput(node, ctx)) return uniqueReferenceImages([...upstream, ...manual]);
-    if(self.length) return uniqueReferenceImages([...self, ...manual]);
+    if(self.length) return uniqueReferenceImages([...self, ...upstream, ...manual]);
     return uniqueReferenceImages([...upstream, ...manual]);
 }
 function lineConnectionsFor(node){
